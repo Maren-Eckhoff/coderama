@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 OPEN_TARGETS_GRAPHQL_URL = "https://api.platform.opentargets.org/api/v4/graphql"
 EBI_OLS4_SEARCH_URL = "https://www.ebi.ac.uk/ols4/api/search"
+CHEMBL_DRUG_INDICATION_URL = "https://www.ebi.ac.uk/chembl/api/data/drug_indication.json"
+CHEMBL_MOLECULE_URL = "https://www.ebi.ac.uk/chembl/api/data/molecule.json"
+CHEMBL_MECHANISM_URL = "https://www.ebi.ac.uk/chembl/api/data/mechanism.json"
 CLINICAL_TRIALS_API_URL = "https://clinicaltrials.gov/api/v2/studies"
 EUROPE_PMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 
@@ -340,12 +343,108 @@ def fetch_known_targets(
         }
 
 
+def _fetch_drugs_via_chembl(
+    efo_id: str, limit: int, client: httpx.Client
+) -> list[dict[str, Any]]:
+    """Fallback lookup for approved/clinical drugs via EBI ChEMBL REST API."""
+    colon_efo = efo_id.replace("_", ":")
+    resp = client.get(
+        CHEMBL_DRUG_INDICATION_URL,
+        params={
+            "efo_id": colon_efo,
+            "limit": limit * 3,
+            "format": "json",
+        },
+    )
+    resp.raise_for_status()
+    indications = resp.json().get("drug_indications") or []
+    if not indications:
+        return []
+
+    # Sort by max_phase_for_ind descending so Phase 4 (Approved) drugs appear first
+    indications.sort(
+        key=lambda x: float(x.get("max_phase_for_ind") or 0),
+        reverse=True,
+    )
+
+    selected_chembl_ids: list[str] = []
+    phase_by_chembl: dict[str, Any] = {}
+    for ind in indications:
+        mol_id = ind.get("molecule_chembl_id") or ind.get("parent_molecule_chembl_id")
+        if mol_id and mol_id not in phase_by_chembl:
+            phase_by_chembl[mol_id] = ind.get("max_phase_for_ind")
+            selected_chembl_ids.append(mol_id)
+        if len(selected_chembl_ids) >= limit:
+            break
+
+    if not selected_chembl_ids:
+        return []
+
+    ids_csv = ",".join(selected_chembl_ids)
+    mol_map: dict[str, dict[str, Any]] = {}
+    mech_map: dict[str, dict[str, Any]] = {}
+
+    try:
+        mol_resp = client.get(
+            CHEMBL_MOLECULE_URL,
+            params={
+                "molecule_chembl_id__in": ids_csv,
+                "limit": len(selected_chembl_ids),
+                "format": "json",
+            },
+        )
+        mol_resp.raise_for_status()
+        for mol in mol_resp.json().get("molecules") or []:
+            cid = mol.get("molecule_chembl_id")
+            if cid:
+                mol_map[cid] = mol
+    except Exception as exc:
+        logger.debug("ChEMBL molecule metadata lookup failed: %s", exc)
+
+    try:
+        mech_resp = client.get(
+            CHEMBL_MECHANISM_URL,
+            params={
+                "molecule_chembl_id__in": ids_csv,
+                "limit": len(selected_chembl_ids) * 2,
+                "format": "json",
+            },
+        )
+        mech_resp.raise_for_status()
+        for mech in mech_resp.json().get("mechanisms") or []:
+            cid = mech.get("molecule_chembl_id")
+            if cid and cid not in mech_map:
+                mech_map[cid] = mech
+    except Exception as exc:
+        logger.debug("ChEMBL mechanism lookup failed: %s", exc)
+
+    results: list[dict[str, Any]] = []
+    for cid in selected_chembl_ids:
+        mol = mol_map.get(cid, {})
+        mech = mech_map.get(cid, {})
+        phase = phase_by_chembl.get(cid)
+        results.append(
+            {
+                "drug_name": mol.get("pref_name") or cid,
+                "chembl_id": cid,
+                "drug_type": mol.get("molecule_type"),
+                "max_clinical_phase": phase,
+                "trial_status": "Approved" if str(phase) in ("4", "4.0") else "Clinical Trial",
+                "mechanism_of_action": mech.get("mechanism_of_action"),
+                "target_symbol": mech.get("target_chembl_id"),
+                "target_ensembl_id": None,
+                "chembl_url": f"https://www.ebi.ac.uk/chembl/compound_report_card/{cid}/",
+            }
+        )
+    return results
+
+
 def fetch_treatments_and_trials(
     efo_id: str,
     disease_name: str,
     limit: int,
 ) -> dict[str, Any]:
-    """Fetches existing approved/investigational drugs from Open Targets and clinical trials from ClinicalTrials.gov v2.
+    """Fetches existing approved/investigational drugs from Open Targets / ChEMBL and clinical trials from ClinicalTrials.gov v2.
 
     Args:
         efo_id: Canonical ontology identifier (e.g., 'EFO_0000768').
@@ -381,7 +480,6 @@ def fetch_treatments_and_trials(
               approvedSymbol
               approvedName
             }
-            ctIds
           }
         }
       }
@@ -394,7 +492,7 @@ def fetch_treatments_and_trials(
     errors: list[str] = []
 
     with httpx.Client(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
-        # 1. Fetch known drugs from Open Targets
+        # 1. Fetch known drugs from Open Targets (with ChEMBL REST fallback)
         if cleaned_efo:
             try:
                 resp = client.post(
@@ -428,7 +526,6 @@ def fetch_treatments_and_trials(
                             "mechanism_of_action": row.get("mechanismOfAction"),
                             "target_symbol": target_obj.get("approvedSymbol"),
                             "target_ensembl_id": target_id,
-                            "clinical_trial_ids": (row.get("ctIds") or [])[:5],
                             "chembl_url": f"https://www.ebi.ac.uk/chembl/compound_report_card/{drug_id}/"
                             if drug_id
                             else None,
@@ -437,8 +534,15 @@ def fetch_treatments_and_trials(
                     if len(known_drugs) >= capped_limit:
                         break
             except Exception as exc:
-                logger.warning("Open Targets knownDrugs query failed: %s", exc)
-                errors.append(f"Open Targets knownDrugs error: {exc}")
+                logger.debug("Open Targets knownDrugs fallback to ChEMBL: %s", exc)
+                try:
+                    known_drugs = _fetch_drugs_via_chembl(
+                        cleaned_efo, capped_limit, client
+                    )
+                    unique_drugs_count = len(known_drugs)
+                except Exception as chembl_exc:
+                    logger.warning("ChEMBL fallback query failed: %s", chembl_exc)
+                    errors.append(f"Known drugs lookup error: {chembl_exc}")
 
         # 2. Fetch active/recent studies from ClinicalTrials.gov v2
         if cleaned_name:
