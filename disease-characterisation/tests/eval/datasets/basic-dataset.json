@@ -1,0 +1,37 @@
+{
+  "eval_cases": [
+    {
+      "eval_case_id": "efo_and_icd10_normalization",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Characterize Idiopathic Pulmonary Fibrosis, ensuring the canonical EFO ID and ICD-10 code are displayed in the header."
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "known_targets_and_treatments_retrieval",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Characterize Crohn's disease with its top known biological targets, existing treatments, and clinical trials."
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "recent_publications_max_5_with_preprints",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Characterize Non-Small Cell Lung Cancer and surface at most 5 recent publications, including any relevant bioRxiv or medRxiv preprints."
+          }
+        ]
+      }
+    }
+  ]
+}

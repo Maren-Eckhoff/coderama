@@ -218,3 +218,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ADK & Agents CLI local artifacts and traces
+artifacts/
+**/artifacts/
+.adk/
+.google-agents-cli/
+*.tfstate
+*.tfstate.*
+.terraform*
