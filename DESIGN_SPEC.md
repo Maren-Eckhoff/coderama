@@ -17,17 +17,19 @@ The **Automated Disease Characterisation Agent** accelerates early-stage scoping
 
 ```
 root_agent (Coordinator LlmAgent)
-└── disease_characterisation_pipeline (SequentialAgent)
+└── disease_characterisation_pipeline (Workflow DAG)
     ├── 1. disease_resolver_agent (LlmAgent)
     │      └── Tool: resolve_disease_ontology -> writes session.state["disease_context"] (EFO ID + ICD-10 codes)
-    ├── 2. parallel_research_agent (ParallelAgent)
+    ├── 2. Parallel Fan-Out: (targets_agent, treatments_agent, literature_agent)
     │      ├── targets_agent (LlmAgent)
     │      │   └── Tool: fetch_known_targets -> writes session.state["targets_report"]
     │      ├── treatments_agent (LlmAgent)
     │      │   └── Tool: fetch_treatments_and_trials -> writes session.state["treatments_report"]
     │      └── literature_agent (LlmAgent)
     │          └── Tool: fetch_recent_publications -> writes session.state["literature_report"]
-    └── 3. dossier_synthesizer_agent (LlmAgent)
+    ├── 3. research_join (JoinNode)
+    │      └── Synchronizes all three parallel research branches
+    └── 4. dossier_synthesizer_agent (LlmAgent)
            └── Tool: save_dossier_artifact -> produces final structured Markdown dossier
 ```
 

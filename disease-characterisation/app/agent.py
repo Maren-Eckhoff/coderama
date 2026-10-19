@@ -14,11 +14,12 @@
 # limitations under the License.
 
 from dotenv import load_dotenv
-from google.adk.agents import Agent, ParallelAgent, SequentialAgent
+from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.apps.app import App, EventsCompactionConfig
 from google.adk.models import Gemini
 from google.adk.plugins import ReflectAndRetryToolPlugin
+from google.adk.workflow import JoinNode, Workflow
 from google.genai import types
 
 load_dotenv()
@@ -137,10 +138,9 @@ Using the resolved disease context below:
     output_key="literature_report",
 )
 
-parallel_research_agent = ParallelAgent(
-    name="parallel_research_agent",
-    description="Concurrently retrieves known targets, existing treatments/trials, and recent literature/preprints.",
-    sub_agents=[targets_agent, treatments_agent, literature_agent],
+research_join = JoinNode(
+    name="research_join",
+    description="Synchronizes parallel target, treatment, and literature research branches.",
 )
 
 dossier_synthesizer_agent = Agent(
@@ -181,13 +181,18 @@ Finally, call `save_dossier_artifact` with the `efo_id` and the complete Markdow
     output_key="characterisation_dossier",
 )
 
-disease_characterisation_pipeline = SequentialAgent(
+disease_characterisation_pipeline = Workflow(
     name="disease_characterisation_pipeline",
     description="Executes full disease characterisation: ontology normalization (EFO + ICD-10), parallel research across targets, treatments, and literature/preprints, and dossier synthesis.",
-    sub_agents=[
-        disease_resolver_agent,
-        parallel_research_agent,
-        dossier_synthesizer_agent,
+    input_schema=str,
+    edges=[
+        (
+            "START",
+            disease_resolver_agent,
+            (targets_agent, treatments_agent, literature_agent),
+            research_join,
+            dossier_synthesizer_agent,
+        ),
     ],
 )
 
@@ -201,11 +206,11 @@ root_agent = Agent(
     description="Automated Disease Characterisation Agent for Life Sciences scoping.",
     instruction="""You are the Automated Disease Characterisation Coordinator for Life Sciences scoping.
 
-- When the user enters a disease name or asks to characterize/scope a disease, delegate to `disease_characterisation_pipeline` to run the full ontology normalization (EFO + ICD-10), parallel target/treatment/literature analysis, and dossier synthesis.
+- When the user enters a disease name or asks to characterize/scope a disease, call the `disease_characterisation_pipeline` workflow tool (passing the disease name/query as `request`) to run the full ontology normalization (EFO + ICD-10), parallel target/treatment/literature analysis, and dossier synthesis. Once `disease_characterisation_pipeline` completes, present its synthesized Markdown dossier verbatim in your response without omitting any tables, identifiers, badges, or disclaimers.
 - When the user asks a targeted follow-up question about a disease already characterized in the current session (stored in `{disease_context}`, `{targets_report}`, `{treatments_report}`, `{literature_report}`), answer using the session state or call the specific tool (`resolve_disease_ontology`, `fetch_known_targets`, `fetch_treatments_and_trials`, `fetch_recent_publications`, `save_dossier_artifact`) as needed.
 - Always ground every identifier (`EFO`, `ICD-10`, `ENSG`, `ChEMBL`, `NCT`, `PMID`, `DOI`) in tool outputs, cap publication lists at a maximum of 5 (labeling `bioRxiv`/`medRxiv` preprints clearly), and include a non-clinical research scoping disclaimer.""",
-    sub_agents=[disease_characterisation_pipeline],
     tools=[
+        disease_characterisation_pipeline,
         resolve_disease_ontology,
         fetch_known_targets,
         fetch_treatments_and_trials,

@@ -24,7 +24,7 @@ import pytest
 from app.agent import (
     app,
     disease_characterisation_pipeline,
-    parallel_research_agent,
+    research_join,
     root_agent,
 )
 from app.tools import (
@@ -46,15 +46,27 @@ class _DummyToolContext:
 
 
 def test_app_and_orchestration_configuration() -> None:
-    """Verify ADK App name, 5-event compaction config, and multi-agent topology."""
+    """Verify ADK App name, 5-event compaction config, and Workflow DAG topology."""
+    from google.adk.workflow import JoinNode, Workflow
+
     assert app.name == "app"
     assert root_agent.name == "disease_characterisation"
     assert app.events_compaction_config is not None
     assert app.events_compaction_config.compaction_interval == 5
     assert app.events_compaction_config.overlap_size == 1
 
-    assert len(disease_characterisation_pipeline.sub_agents) == 3
-    assert len(parallel_research_agent.sub_agents) == 3
+    assert isinstance(disease_characterisation_pipeline, Workflow)
+    assert isinstance(research_join, JoinNode)
+    assert disease_characterisation_pipeline.graph is not None
+    node_names = {node.name for node in disease_characterisation_pipeline.graph.nodes}
+    assert {
+        "disease_resolver_agent",
+        "targets_agent",
+        "treatments_agent",
+        "literature_agent",
+        "research_join",
+        "dossier_synthesizer_agent",
+    }.issubset(node_names)
 
 
 def test_extract_icd10_codes() -> None:
