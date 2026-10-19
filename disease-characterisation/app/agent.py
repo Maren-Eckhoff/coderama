@@ -23,6 +23,7 @@ from google.genai import types
 
 load_dotenv()
 
+from app.app_utils.telemetry import DiseaseObservabilityPlugin
 from app.tools import (
     fetch_known_targets,
     fetch_recent_publications,
@@ -221,5 +222,8 @@ app = App(
         compaction_interval=5,
         overlap_size=1,
     ),
-    plugins=[ReflectAndRetryToolPlugin()],
+    plugins=[
+        DiseaseObservabilityPlugin(),
+        ReflectAndRetryToolPlugin(),
+    ],
 )

@@ -16,15 +16,18 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from typing import Any
 
 import httpx
 from google.adk.tools import ToolContext
 from google.genai import types
+from opentelemetry import trace
 
-logger = logging.getLogger(__name__)
+from app.app_utils.telemetry import get_structured_logger, redact_pii
+
+logger = get_structured_logger("disease_characterisation.tools")
+tracer = trace.get_tracer("disease_characterisation.tools")
 
 OPEN_TARGETS_GRAPHQL_URL = "https://api.platform.opentargets.org/api/v4/graphql"
 EBI_OLS4_SEARCH_URL = "https://www.ebi.ac.uk/ols4/api/search"
@@ -61,30 +64,34 @@ def _lookup_icd10_via_ols4(
     """Fallback lookup of ICD-10 cross-references via the EBI OLS4 REST API."""
     icd10_codes: list[str] = []
     seen: set[str] = set()
-    try:
-        resp = client.get(
-            EBI_OLS4_SEARCH_URL,
-            params={
-                "q": efo_id if efo_id else disease_name,
-                "FieldList": "iri,label,short_form,obo_id,annotations_trimmed",
-                "rows": 5,
-            },
-        )
-        resp.raise_for_status()
-        docs = resp.json().get("response", {}).get("docs", [])
-        for doc in docs:
-            for text in doc.get("annotations_trimmed", []) or []:
-                for match in re.findall(
-                    r"\bICD10(?:CM)?[:\s]+([A-Z]\d{2}(?:\.[A-Z0-9]{1,4})?)\b",
-                    str(text),
-                    flags=re.IGNORECASE,
-                ):
-                    code = f"ICD10:{match.upper()}"
-                    if code not in seen:
-                        seen.add(code)
-                        icd10_codes.append(code)
-    except Exception as exc:
-        logger.debug("OLS4 ICD-10 fallback lookup failed: %s", exc)
+    with tracer.start_as_current_span("ebi.ols4.icd10_fallback") as span:
+        span.set_attribute("disease.efo_id", efo_id)
+        try:
+            resp = client.get(
+                EBI_OLS4_SEARCH_URL,
+                params={
+                    "q": efo_id if efo_id else disease_name,
+                    "FieldList": "iri,label,short_form,obo_id,annotations_trimmed",
+                    "rows": 5,
+                },
+            )
+            span.set_attribute("http.status_code", resp.status_code)
+            resp.raise_for_status()
+            docs = resp.json().get("response", {}).get("docs", [])
+            for doc in docs:
+                for text in doc.get("annotations_trimmed", []) or []:
+                    for match in re.findall(
+                        r"\bICD10(?:CM)?[:\s]+([A-Z]\d{2}(?:\.[A-Z0-9]{1,4})?)\b",
+                        str(text),
+                        flags=re.IGNORECASE,
+                    ):
+                        code = f"ICD10:{match.upper()}"
+                        if code not in seen:
+                            seen.add(code)
+                            icd10_codes.append(code)
+            span.set_attribute("disease.icd10_fallback_count", len(icd10_codes))
+        except Exception as exc:
+            logger.debug("OLS4 ICD-10 fallback lookup failed: %s", exc)
     return icd10_codes
 
 
@@ -101,12 +108,16 @@ def resolve_disease_ontology(
         dict with 'status', 'efo_id', 'name', 'icd10_codes', 'description',
         'synonyms', 'therapeutic_areas', and 'open_targets_url'.
     """
-    cleaned_query = (disease_query or "").strip()
+    cleaned_query = redact_pii((disease_query or "").strip())
     if not cleaned_query:
         return {
             "status": "error",
             "message": "Disease query cannot be empty.",
         }
+
+    parent_span = trace.get_current_span()
+    if parent_span and parent_span.is_recording():
+        parent_span.set_attribute("disease.query", cleaned_query)
 
     search_gql = """
     query SearchDisease($queryString: String!) {
@@ -141,13 +152,23 @@ def resolve_disease_ontology(
 
     try:
         with httpx.Client(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
-            search_resp = client.post(
-                OPEN_TARGETS_GRAPHQL_URL,
-                json={"query": search_gql, "variables": {"queryString": cleaned_query}},
-            )
-            search_resp.raise_for_status()
-            search_data = search_resp.json().get("data", {}) or {}
-            hits = (search_data.get("search") or {}).get("hits") or []
+            with tracer.start_as_current_span(
+                "opentargets.graphql.search_disease"
+            ) as search_span:
+                search_span.set_attribute("graphql.operation", "SearchDisease")
+                search_span.set_attribute("disease.query", cleaned_query)
+                search_resp = client.post(
+                    OPEN_TARGETS_GRAPHQL_URL,
+                    json={
+                        "query": search_gql,
+                        "variables": {"queryString": cleaned_query},
+                    },
+                )
+                search_span.set_attribute("http.status_code", search_resp.status_code)
+                search_resp.raise_for_status()
+                search_data = search_resp.json().get("data", {}) or {}
+                hits = (search_data.get("search") or {}).get("hits") or []
+                search_span.set_attribute("search.hit_count", len(hits))
 
             if not hits:
                 return {
@@ -159,16 +180,26 @@ def resolve_disease_ontology(
             top_hit = hits[0]
             efo_id = top_hit["id"]
 
-            details_resp = client.post(
-                OPEN_TARGETS_GRAPHQL_URL,
-                json={"query": details_gql, "variables": {"efoId": efo_id}},
-            )
-            details_resp.raise_for_status()
-            disease_obj = (details_resp.json().get("data") or {}).get("disease") or {}
+            with tracer.start_as_current_span(
+                "opentargets.graphql.disease_details"
+            ) as details_span:
+                details_span.set_attribute("graphql.operation", "DiseaseDetails")
+                details_span.set_attribute("disease.efo_id", efo_id)
+                details_resp = client.post(
+                    OPEN_TARGETS_GRAPHQL_URL,
+                    json={"query": details_gql, "variables": {"efoId": efo_id}},
+                )
+                details_span.set_attribute("http.status_code", details_resp.status_code)
+                details_resp.raise_for_status()
+                disease_obj = (
+                    (details_resp.json().get("data") or {}).get("disease") or {}
+                )
 
             db_xrefs = disease_obj.get("dbXRefs") or []
             icd10_codes = _extract_icd10_codes(db_xrefs)
+            ols4_fallback_used = False
             if not icd10_codes:
+                ols4_fallback_used = True
                 icd10_codes = _lookup_icd10_via_ols4(
                     disease_obj.get("name") or top_hit.get("name") or cleaned_query,
                     efo_id,
@@ -193,11 +224,12 @@ def resolve_disease_ontology(
                 if h.get("id")
             ]
 
+            canonical_name = disease_obj.get("name") or top_hit.get("name")
             result = {
                 "status": "success",
                 "query": cleaned_query,
                 "efo_id": efo_id,
-                "name": disease_obj.get("name") or top_hit.get("name"),
+                "name": canonical_name,
                 "icd10_codes": icd10_codes,
                 "other_xrefs": [
                     ref
@@ -214,8 +246,18 @@ def resolve_disease_ontology(
                 "open_targets_url": f"https://platform.opentargets.org/disease/{efo_id}",
             }
 
+            if parent_span and parent_span.is_recording():
+                parent_span.set_attribute("disease.efo_id", efo_id)
+                parent_span.set_attribute("disease.name", str(canonical_name or ""))
+                parent_span.set_attribute("disease.icd10_codes", ",".join(icd10_codes))
+                parent_span.set_attribute(
+                    "disease.ols4_fallback_used", ols4_fallback_used
+                )
+
             if tool_context is not None and hasattr(tool_context, "state"):
                 tool_context.state["disease_context"] = result
+                tool_context.state["efo_id"] = efo_id
+                tool_context.state["icd10_codes"] = icd10_codes
 
             return result
     except Exception as exc:
@@ -241,11 +283,14 @@ def fetch_known_targets(
         dict with 'status', 'efo_id', 'total_associated_targets', and 'targets' list
         containing gene symbols, Ensembl IDs, association scores, and tractability.
     """
-    cleaned_efo = (efo_id or "").strip()
+    cleaned_efo = redact_pii((efo_id or "").strip())
     if not cleaned_efo:
         return {"status": "error", "message": "efo_id cannot be empty."}
 
     capped_limit = min(max(int(limit), 1), 15)
+    parent_span = trace.get_current_span()
+    if parent_span and parent_span.is_recording():
+        parent_span.set_attribute("disease.efo_id", cleaned_efo)
 
     targets_gql = """
     query AssociatedTargets($efoId: String!, $size: Int!) {
@@ -279,15 +324,22 @@ def fetch_known_targets(
 
     try:
         with httpx.Client(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
-            resp = client.post(
-                OPEN_TARGETS_GRAPHQL_URL,
-                json={
-                    "query": targets_gql,
-                    "variables": {"efoId": cleaned_efo, "size": capped_limit},
-                },
-            )
-            resp.raise_for_status()
-            disease_data = (resp.json().get("data") or {}).get("disease")
+            with tracer.start_as_current_span(
+                "opentargets.graphql.associated_targets"
+            ) as ot_span:
+                ot_span.set_attribute("graphql.operation", "AssociatedTargets")
+                ot_span.set_attribute("disease.efo_id", cleaned_efo)
+                resp = client.post(
+                    OPEN_TARGETS_GRAPHQL_URL,
+                    json={
+                        "query": targets_gql,
+                        "variables": {"efoId": cleaned_efo, "size": capped_limit},
+                    },
+                )
+                ot_span.set_attribute("http.status_code", resp.status_code)
+                resp.raise_for_status()
+                disease_data = (resp.json().get("data") or {}).get("disease")
+
             if not disease_data:
                 return {
                     "status": "not_found",
@@ -327,11 +379,16 @@ def fetch_known_targets(
                     }
                 )
 
+            total_count = assoc.get("count", len(targets_list))
+            if parent_span and parent_span.is_recording():
+                parent_span.set_attribute("targets.total_count", int(total_count))
+                parent_span.set_attribute("targets.returned_count", len(targets_list))
+
             return {
                 "status": "success",
                 "efo_id": cleaned_efo,
                 "disease_name": disease_data.get("name"),
-                "total_associated_targets": assoc.get("count", len(targets_list)),
+                "total_associated_targets": total_count,
                 "targets": targets_list,
             }
     except Exception as exc:
@@ -348,95 +405,105 @@ def _fetch_drugs_via_chembl(
 ) -> list[dict[str, Any]]:
     """Fallback lookup for approved/clinical drugs via EBI ChEMBL REST API."""
     colon_efo = efo_id.replace("_", ":")
-    resp = client.get(
-        CHEMBL_DRUG_INDICATION_URL,
-        params={
-            "efo_id": colon_efo,
-            "limit": limit * 3,
-            "format": "json",
-        },
-    )
-    resp.raise_for_status()
-    indications = resp.json().get("drug_indications") or []
-    if not indications:
-        return []
-
-    # Sort by max_phase_for_ind descending so Phase 4 (Approved) drugs appear first
-    indications.sort(
-        key=lambda x: float(x.get("max_phase_for_ind") or 0),
-        reverse=True,
-    )
-
-    selected_chembl_ids: list[str] = []
-    phase_by_chembl: dict[str, Any] = {}
-    for ind in indications:
-        mol_id = ind.get("molecule_chembl_id") or ind.get("parent_molecule_chembl_id")
-        if mol_id and mol_id not in phase_by_chembl:
-            phase_by_chembl[mol_id] = ind.get("max_phase_for_ind")
-            selected_chembl_ids.append(mol_id)
-        if len(selected_chembl_ids) >= limit:
-            break
-
-    if not selected_chembl_ids:
-        return []
-
-    ids_csv = ",".join(selected_chembl_ids)
-    mol_map: dict[str, dict[str, Any]] = {}
-    mech_map: dict[str, dict[str, Any]] = {}
-
-    try:
-        mol_resp = client.get(
-            CHEMBL_MOLECULE_URL,
+    with tracer.start_as_current_span("ebi.chembl.fallback") as span:
+        span.set_attribute("disease.efo_id", efo_id)
+        resp = client.get(
+            CHEMBL_DRUG_INDICATION_URL,
             params={
-                "molecule_chembl_id__in": ids_csv,
-                "limit": len(selected_chembl_ids),
+                "efo_id": colon_efo,
+                "limit": limit * 3,
                 "format": "json",
             },
         )
-        mol_resp.raise_for_status()
-        for mol in mol_resp.json().get("molecules") or []:
-            cid = mol.get("molecule_chembl_id")
-            if cid:
-                mol_map[cid] = mol
-    except Exception as exc:
-        logger.debug("ChEMBL molecule metadata lookup failed: %s", exc)
+        span.set_attribute("http.status_code", resp.status_code)
+        resp.raise_for_status()
+        indications = resp.json().get("drug_indications") or []
+        if not indications:
+            span.set_attribute("chembl.drugs_returned", 0)
+            return []
 
-    try:
-        mech_resp = client.get(
-            CHEMBL_MECHANISM_URL,
-            params={
-                "molecule_chembl_id__in": ids_csv,
-                "limit": len(selected_chembl_ids) * 2,
-                "format": "json",
-            },
+        # Sort by max_phase_for_ind descending so Phase 4 (Approved) drugs appear first
+        indications.sort(
+            key=lambda x: float(x.get("max_phase_for_ind") or 0),
+            reverse=True,
         )
-        mech_resp.raise_for_status()
-        for mech in mech_resp.json().get("mechanisms") or []:
-            cid = mech.get("molecule_chembl_id")
-            if cid and cid not in mech_map:
-                mech_map[cid] = mech
-    except Exception as exc:
-        logger.debug("ChEMBL mechanism lookup failed: %s", exc)
 
-    results: list[dict[str, Any]] = []
-    for cid in selected_chembl_ids:
-        mol = mol_map.get(cid, {})
-        mech = mech_map.get(cid, {})
-        phase = phase_by_chembl.get(cid)
-        results.append(
-            {
-                "drug_name": mol.get("pref_name") or cid,
-                "chembl_id": cid,
-                "drug_type": mol.get("molecule_type"),
-                "max_clinical_phase": phase,
-                "trial_status": "Approved" if str(phase) in ("4", "4.0") else "Clinical Trial",
-                "mechanism_of_action": mech.get("mechanism_of_action"),
-                "target_symbol": mech.get("target_chembl_id"),
-                "target_ensembl_id": None,
-                "chembl_url": f"https://www.ebi.ac.uk/chembl/compound_report_card/{cid}/",
-            }
-        )
-    return results
+        selected_chembl_ids: list[str] = []
+        phase_by_chembl: dict[str, Any] = {}
+        for ind in indications:
+            mol_id = ind.get("molecule_chembl_id") or ind.get(
+                "parent_molecule_chembl_id"
+            )
+            if mol_id and mol_id not in phase_by_chembl:
+                phase_by_chembl[mol_id] = ind.get("max_phase_for_ind")
+                selected_chembl_ids.append(mol_id)
+            if len(selected_chembl_ids) >= limit:
+                break
+
+        if not selected_chembl_ids:
+            span.set_attribute("chembl.drugs_returned", 0)
+            return []
+
+        ids_csv = ",".join(selected_chembl_ids)
+        mol_map: dict[str, dict[str, Any]] = {}
+        mech_map: dict[str, dict[str, Any]] = {}
+
+        try:
+            mol_resp = client.get(
+                CHEMBL_MOLECULE_URL,
+                params={
+                    "molecule_chembl_id__in": ids_csv,
+                    "limit": len(selected_chembl_ids),
+                    "format": "json",
+                },
+            )
+            mol_resp.raise_for_status()
+            for mol in mol_resp.json().get("molecules") or []:
+                cid = mol.get("molecule_chembl_id")
+                if cid:
+                    mol_map[cid] = mol
+        except Exception as exc:
+            logger.debug("ChEMBL molecule metadata lookup failed: %s", exc)
+
+        try:
+            mech_resp = client.get(
+                CHEMBL_MECHANISM_URL,
+                params={
+                    "molecule_chembl_id__in": ids_csv,
+                    "limit": len(selected_chembl_ids) * 2,
+                    "format": "json",
+                },
+            )
+            mech_resp.raise_for_status()
+            for mech in mech_resp.json().get("mechanisms") or []:
+                cid = mech.get("molecule_chembl_id")
+                if cid and cid not in mech_map:
+                    mech_map[cid] = mech
+        except Exception as exc:
+            logger.debug("ChEMBL mechanism lookup failed: %s", exc)
+
+        results: list[dict[str, Any]] = []
+        for cid in selected_chembl_ids:
+            mol = mol_map.get(cid, {})
+            mech = mech_map.get(cid, {})
+            phase = phase_by_chembl.get(cid)
+            results.append(
+                {
+                    "drug_name": mol.get("pref_name") or cid,
+                    "chembl_id": cid,
+                    "drug_type": mol.get("molecule_type"),
+                    "max_clinical_phase": phase,
+                    "trial_status": "Approved"
+                    if str(phase) in ("4", "4.0")
+                    else "Clinical Trial",
+                    "mechanism_of_action": mech.get("mechanism_of_action"),
+                    "target_symbol": mech.get("target_chembl_id"),
+                    "target_ensembl_id": None,
+                    "chembl_url": f"https://www.ebi.ac.uk/chembl/compound_report_card/{cid}/",
+                }
+            )
+        span.set_attribute("chembl.drugs_returned", len(results))
+        return results
 
 
 def fetch_treatments_and_trials(
@@ -455,9 +522,14 @@ def fetch_treatments_and_trials(
         dict with 'status', 'efo_id', 'known_drugs' (ChEMBL ID, drug name, modality, MoA, phase, target),
         and 'clinical_trials' (NCT ID, title, status, phases, interventions).
     """
-    cleaned_efo = (efo_id or "").strip()
-    cleaned_name = (disease_name or "").strip()
+    cleaned_efo = redact_pii((efo_id or "").strip())
+    cleaned_name = redact_pii((disease_name or "").strip())
     capped_limit = min(max(int(limit), 1), 15)
+
+    parent_span = trace.get_current_span()
+    if parent_span and parent_span.is_recording():
+        parent_span.set_attribute("disease.efo_id", cleaned_efo)
+        parent_span.set_attribute("disease.name", cleaned_name)
 
     drugs_gql = """
     query KnownDrugs($efoId: String!, $size: Int!) {
@@ -490,51 +562,75 @@ def fetch_treatments_and_trials(
     unique_drugs_count = 0
     clinical_trials: list[dict[str, Any]] = []
     errors: list[str] = []
+    chembl_fallback_used = False
 
     with httpx.Client(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
         # 1. Fetch known drugs from Open Targets (with ChEMBL REST fallback)
         if cleaned_efo:
             try:
-                resp = client.post(
-                    OPEN_TARGETS_GRAPHQL_URL,
-                    json={
-                        "query": drugs_gql,
-                        "variables": {"efoId": cleaned_efo, "size": capped_limit * 3},
+                with tracer.start_as_current_span(
+                    "opentargets.graphql.known_drugs"
+                ) as kd_span:
+                    kd_span.set_attribute("graphql.operation", "KnownDrugs")
+                    kd_span.set_attribute("disease.efo_id", cleaned_efo)
+                    resp = client.post(
+                        OPEN_TARGETS_GRAPHQL_URL,
+                        json={
+                            "query": drugs_gql,
+                            "variables": {
+                                "efoId": cleaned_efo,
+                                "size": capped_limit * 3,
+                            },
+                        },
+                    )
+                    kd_span.set_attribute("http.status_code", resp.status_code)
+                    resp.raise_for_status()
+                    disease_data = (
+                        (resp.json().get("data") or {}).get("disease") or {}
+                    )
+                    kd = disease_data.get("knownDrugs") or {}
+                    unique_drugs_count = kd.get("uniqueDrugs", 0)
+
+                    seen_drug_targets: set[tuple[str, str]] = set()
+                    for row in kd.get("rows") or []:
+                        drug_id = row.get("drugId") or ""
+                        target_id = row.get("targetId") or ""
+                        key = (drug_id, target_id)
+                        if key in seen_drug_targets:
+                            continue
+                        seen_drug_targets.add(key)
+                        target_obj = row.get("target") or {}
+                        known_drugs.append(
+                            {
+                                "drug_name": row.get("prefName"),
+                                "chembl_id": drug_id,
+                                "drug_type": row.get("drugType"),
+                                "max_clinical_phase": row.get("phase"),
+                                "trial_status": row.get("status"),
+                                "mechanism_of_action": row.get("mechanismOfAction"),
+                                "target_symbol": target_obj.get("approvedSymbol"),
+                                "target_ensembl_id": target_id,
+                                "chembl_url": f"https://www.ebi.ac.uk/chembl/compound_report_card/{drug_id}/"
+                                if drug_id
+                                else None,
+                            }
+                        )
+                        if len(known_drugs) >= capped_limit:
+                            break
+                    kd_span.set_attribute("treatments.drugs_count", len(known_drugs))
+            except Exception as exc:
+                chembl_fallback_used = True
+                logger.info(
+                    "Open Targets knownDrugs fallback to ChEMBL for %s: %s",
+                    cleaned_efo,
+                    exc,
+                    extra={
+                        "structured_data": {
+                            "event_type": "chembl_fallback",
+                            "efo_id": cleaned_efo,
+                        }
                     },
                 )
-                resp.raise_for_status()
-                disease_data = (resp.json().get("data") or {}).get("disease") or {}
-                kd = disease_data.get("knownDrugs") or {}
-                unique_drugs_count = kd.get("uniqueDrugs", 0)
-
-                seen_drug_targets: set[tuple[str, str]] = set()
-                for row in kd.get("rows") or []:
-                    drug_id = row.get("drugId") or ""
-                    target_id = row.get("targetId") or ""
-                    key = (drug_id, target_id)
-                    if key in seen_drug_targets:
-                        continue
-                    seen_drug_targets.add(key)
-                    target_obj = row.get("target") or {}
-                    known_drugs.append(
-                        {
-                            "drug_name": row.get("prefName"),
-                            "chembl_id": drug_id,
-                            "drug_type": row.get("drugType"),
-                            "max_clinical_phase": row.get("phase"),
-                            "trial_status": row.get("status"),
-                            "mechanism_of_action": row.get("mechanismOfAction"),
-                            "target_symbol": target_obj.get("approvedSymbol"),
-                            "target_ensembl_id": target_id,
-                            "chembl_url": f"https://www.ebi.ac.uk/chembl/compound_report_card/{drug_id}/"
-                            if drug_id
-                            else None,
-                        }
-                    )
-                    if len(known_drugs) >= capped_limit:
-                        break
-            except Exception as exc:
-                logger.debug("Open Targets knownDrugs fallback to ChEMBL: %s", exc)
                 try:
                     known_drugs = _fetch_drugs_via_chembl(
                         cleaned_efo, capped_limit, client
@@ -547,48 +643,63 @@ def fetch_treatments_and_trials(
         # 2. Fetch active/recent studies from ClinicalTrials.gov v2
         if cleaned_name:
             try:
-                ct_resp = client.get(
-                    CLINICAL_TRIALS_API_URL,
-                    params={
-                        "query.cond": cleaned_name,
-                        "pageSize": min(capped_limit, 10),
-                        "format": "json",
-                    },
-                )
-                ct_resp.raise_for_status()
-                studies = ct_resp.json().get("studies") or []
-                for study in studies[:capped_limit]:
-                    proto = study.get("protocolSection") or {}
-                    id_mod = proto.get("identificationModule") or {}
-                    status_mod = proto.get("statusModule") or {}
-                    design_mod = proto.get("designModule") or {}
-                    arms_mod = proto.get("armsInterventionsModule") or {}
-                    sponsor_mod = proto.get("sponsorCollaboratorsModule") or {}
+                with tracer.start_as_current_span(
+                    "clinicaltrials.gov.v2.studies"
+                ) as ct_span:
+                    ct_span.set_attribute("disease.name", cleaned_name)
+                    ct_resp = client.get(
+                        CLINICAL_TRIALS_API_URL,
+                        params={
+                            "query.cond": cleaned_name,
+                            "pageSize": min(capped_limit, 10),
+                            "format": "json",
+                        },
+                    )
+                    ct_span.set_attribute("http.status_code", ct_resp.status_code)
+                    ct_resp.raise_for_status()
+                    studies = ct_resp.json().get("studies") or []
+                    for study in studies[:capped_limit]:
+                        proto = study.get("protocolSection") or {}
+                        id_mod = proto.get("identificationModule") or {}
+                        status_mod = proto.get("statusModule") or {}
+                        design_mod = proto.get("designModule") or {}
+                        arms_mod = proto.get("armsInterventionsModule") or {}
+                        sponsor_mod = proto.get("sponsorCollaboratorsModule") or {}
 
-                    nct_id = id_mod.get("nctId") or ""
-                    interventions = [
-                        f"{iv.get('type', 'OTHER')}: {iv.get('name')}"
-                        for iv in (arms_mod.get("interventions") or [])
-                        if iv.get("name")
-                    ]
-                    clinical_trials.append(
-                        {
-                            "nct_id": nct_id,
-                            "title": id_mod.get("briefTitle"),
-                            "overall_status": status_mod.get("overallStatus"),
-                            "phases": design_mod.get("phases") or [],
-                            "interventions": interventions[:5],
-                            "lead_sponsor": (
-                                sponsor_mod.get("leadSponsor") or {}
-                            ).get("name"),
-                            "url": f"https://clinicaltrials.gov/study/{nct_id}"
-                            if nct_id
-                            else None,
-                        }
+                        nct_id = id_mod.get("nctId") or ""
+                        interventions = [
+                            f"{iv.get('type', 'OTHER')}: {iv.get('name')}"
+                            for iv in (arms_mod.get("interventions") or [])
+                            if iv.get("name")
+                        ]
+                        clinical_trials.append(
+                            {
+                                "nct_id": nct_id,
+                                "title": id_mod.get("briefTitle"),
+                                "overall_status": status_mod.get("overallStatus"),
+                                "phases": design_mod.get("phases") or [],
+                                "interventions": interventions[:5],
+                                "lead_sponsor": (
+                                    sponsor_mod.get("leadSponsor") or {}
+                                ).get("name"),
+                                "url": f"https://clinicaltrials.gov/study/{nct_id}"
+                                if nct_id
+                                else None,
+                            }
+                        )
+                    ct_span.set_attribute(
+                        "treatments.trials_count", len(clinical_trials)
                     )
             except Exception as exc:
                 logger.warning("ClinicalTrials.gov API v2 query failed: %s", exc)
                 errors.append(f"ClinicalTrials.gov error: {exc}")
+
+    if parent_span and parent_span.is_recording():
+        parent_span.set_attribute(
+            "treatments.chembl_fallback_used", chembl_fallback_used
+        )
+        parent_span.set_attribute("treatments.drugs_count", len(known_drugs))
+        parent_span.set_attribute("treatments.trials_count", len(clinical_trials))
 
     if not known_drugs and not clinical_trials and errors:
         return {
@@ -622,7 +733,11 @@ def _format_europe_pmc_record(item: dict[str, Any]) -> dict[str, Any]:
     pmid = item.get("pmid") or ""
 
     combined_pub_info = f"{journal_title} {publisher}".lower()
-    is_preprint = source == "PPR" or "biorxiv" in combined_pub_info or "medrxiv" in combined_pub_info
+    is_preprint = (
+        source == "PPR"
+        or "biorxiv" in combined_pub_info
+        or "medrxiv" in combined_pub_info
+    )
     if "biorxiv" in combined_pub_info or doi.startswith("10.1101/"):
         if "medrxiv" in combined_pub_info:
             preprint_server = "medRxiv"
@@ -686,11 +801,14 @@ def fetch_recent_publications(
     Returns:
         dict with 'status', 'disease_name', 'returned_count' (<= 5), and 'publications' list.
     """
-    cleaned_disease = (disease_name or "").strip()
+    cleaned_disease = redact_pii((disease_name or "").strip())
     if not cleaned_disease:
         return {"status": "error", "message": "disease_name cannot be empty."}
 
     capped_max = min(max(int(max_results), 1), MAX_PUBLICATIONS_CAP)
+    parent_span = trace.get_current_span()
+    if parent_span and parent_span.is_recording():
+        parent_span.set_attribute("literature.disease_name", cleaned_disease)
 
     # Query Europe PMC for both peer-reviewed (SRC:MED) and bioRxiv/medRxiv preprints (SRC:PPR)
     combined_query = (
@@ -702,35 +820,42 @@ def fetch_recent_publications(
 
     try:
         with httpx.Client(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
-            resp = client.get(
-                EUROPE_PMC_SEARCH_URL,
-                params={
-                    "query": combined_query,
-                    "format": "json",
-                    "resultType": "core",
-                    "pageSize": capped_max * 2,
-                    "sort": "FIRST_PDATE_D desc",
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            raw_results = (data.get("resultList") or {}).get("result") or []
-
-            if not raw_results:
-                fallback_resp = client.get(
+            with tracer.start_as_current_span("ebi.europepmc.search") as epmc_span:
+                epmc_span.set_attribute("literature.disease_name", cleaned_disease)
+                resp = client.get(
                     EUROPE_PMC_SEARCH_URL,
                     params={
-                        "query": fallback_query,
+                        "query": combined_query,
                         "format": "json",
                         "resultType": "core",
                         "pageSize": capped_max * 2,
                         "sort": "FIRST_PDATE_D desc",
                     },
                 )
-                fallback_resp.raise_for_status()
-                raw_results = (
-                    (fallback_resp.json().get("resultList") or {}).get("result") or []
-                )
+                epmc_span.set_attribute("http.status_code", resp.status_code)
+                resp.raise_for_status()
+                data = resp.json()
+                total_hit_count = int(data.get("hitCount") or 0)
+                raw_results = (data.get("resultList") or {}).get("result") or []
+
+                if not raw_results:
+                    fallback_resp = client.get(
+                        EUROPE_PMC_SEARCH_URL,
+                        params={
+                            "query": fallback_query,
+                            "format": "json",
+                            "resultType": "core",
+                            "pageSize": capped_max * 2,
+                            "sort": "FIRST_PDATE_D desc",
+                        },
+                    )
+                    fallback_resp.raise_for_status()
+                    fb_data = fallback_resp.json()
+                    total_hit_count = int(fb_data.get("hitCount") or 0)
+                    raw_results = (
+                        (fb_data.get("resultList") or {}).get("result") or []
+                    )
+                epmc_span.set_attribute("literature.total_hit_count", total_hit_count)
 
             publications: list[dict[str, Any]] = []
             seen_keys: set[str] = set()
@@ -744,7 +869,12 @@ def fetch_recent_publications(
                     ).lower()
                     if not any(
                         tok in pub_text
-                        for tok in ("biorxiv", "medrxiv", "cold spring harbor", "10.1101/")
+                        for tok in (
+                            "biorxiv",
+                            "medrxiv",
+                            "cold spring harbor",
+                            "10.1101/",
+                        )
                     ):
                         continue
 
@@ -761,6 +891,14 @@ def fetch_recent_publications(
                 publications.append(formatted)
                 if len(publications) >= capped_max:
                     break
+
+            preprint_count = sum(1 for p in publications if p.get("is_preprint"))
+            if parent_span and parent_span.is_recording():
+                parent_span.set_attribute("literature.total_hit_count", total_hit_count)
+                parent_span.set_attribute(
+                    "literature.returned_count", len(publications)
+                )
+                parent_span.set_attribute("literature.preprint_count", preprint_count)
 
             return {
                 "status": "success",
@@ -795,11 +933,18 @@ async def save_dossier_artifact(
     """
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", (efo_id or "disease").strip())
     filename = f"{safe_id}_dossier.md"
-    content_bytes = (markdown_content or "").encode("utf-8")
+    scrubbed_markdown = redact_pii(markdown_content or "")
+    content_bytes = scrubbed_markdown.encode("utf-8")
+
+    span = trace.get_current_span()
+    if span and span.is_recording():
+        span.set_attribute("disease.efo_id", safe_id)
+        span.set_attribute("dossier.artifact_filename", filename)
+        span.set_attribute("dossier.byte_size", len(content_bytes))
 
     if tool_context is not None and hasattr(tool_context, "state"):
         tool_context.state["latest_dossier_filename"] = filename
-        tool_context.state["latest_dossier_markdown"] = markdown_content
+        tool_context.state["latest_dossier_markdown"] = scrubbed_markdown
 
     try:
         part = types.Part(

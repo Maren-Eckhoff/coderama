@@ -297,3 +297,111 @@ async def test_save_dossier_artifact() -> None:
     assert res["status"] == "success"
     assert res["artifact_filename"] == "EFO_0000768_dossier.md"
     assert ctx.state["latest_dossier_filename"] == "EFO_0000768_dossier.md"
+
+
+def test_pii_redaction_preserves_biomedical_ids() -> None:
+    """Verify redact_pii scrubs PII/PHI while preserving EFO, ICD-10, ENSG, ChEMBL, NCT, PMID, and DOIs."""
+    from app.app_utils.telemetry import redact_pii
+
+    raw_text = (
+        "Patient jane.doe@example.org (SSN 123-45-6789, Phone 415-555-0199, "
+        "MRN: 9948210, DOB: 04/12/1965) diagnosed with EFO_0000768 (ICD10:J84.1), "
+        "target ENSG00000140694, drug CHEMBL1256391, trial NCT05571059, "
+        "paper PMID: 42827411 and DOI 10.1101/2026.10.07.757436."
+    )
+    scrubbed = redact_pii(raw_text)
+
+    assert "jane.doe@example.org" not in scrubbed
+    assert "123-45-6789" not in scrubbed
+    assert "415-555-0199" not in scrubbed
+    assert "9948210" not in scrubbed
+    assert "04/12/1965" not in scrubbed
+    assert "[REDACTED_EMAIL]" in scrubbed
+    assert "[REDACTED_SSN]" in scrubbed
+    assert "[REDACTED_PHONE]" in scrubbed
+    assert "[REDACTED_MRN]" in scrubbed
+    assert "[REDACTED_DOB]" in scrubbed
+
+    # Biomedical identifiers must remain untouched
+    assert "EFO_0000768" in scrubbed
+    assert "ICD10:J84.1" in scrubbed
+    assert "ENSG00000140694" in scrubbed
+    assert "CHEMBL1256391" in scrubbed
+    assert "NCT05571059" in scrubbed
+    assert "42827411" in scrubbed
+    assert "10.1101/2026.10.07.757436" in scrubbed
+
+
+@pytest.mark.asyncio
+async def test_observability_plugin_and_structured_formatter() -> None:
+    """Verify DiseaseObservabilityPlugin scrubs user PII and logs structured JSON."""
+    import json
+    import logging
+
+    from google.genai import types
+
+    from app.app_utils.telemetry import (
+        DiseaseObservabilityPlugin,
+        TraceCorrelatedJsonFormatter,
+    )
+
+    plugin = DiseaseObservabilityPlugin()
+    msg = types.Content(
+        role="user",
+        parts=[
+            types.Part.from_text(
+                text="Characterize IPF for patient john@hospital.org (SSN 111-22-3333)"
+            )
+        ],
+    )
+    sanitized = await plugin.on_user_message_callback(
+        invocation_context=MagicMock(), user_message=msg
+    )
+    assert sanitized is not None
+    assert "john@hospital.org" not in sanitized.parts[0].text
+    assert "[REDACTED_EMAIL]" in sanitized.parts[0].text
+    assert "[REDACTED_SSN]" in sanitized.parts[0].text
+
+    formatter = TraceCorrelatedJsonFormatter(project_id="kaggle-sandbox-686020")
+    record = logging.LogRecord(
+        name="disease_characterisation.test",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="Query by user@example.com for EFO_0000768",
+        args=(),
+        exc_info=None,
+    )
+    record.structured_data = {"event_type": "test_event", "efo_id": "EFO_0000768"}
+    formatted_json = json.loads(formatter.format(record))
+    assert formatted_json["severity"] == "INFO"
+    assert "[REDACTED_EMAIL]" in formatted_json["message"]
+    assert formatted_json["efo_id"] == "EFO_0000768"
+
+
+def test_required_tool_trajectory_metric() -> None:
+    """Verify trajectory_metrics.evaluate scores full and partial tool coverage."""
+    from tests.eval.trajectory_metrics import REQUIRED_TOOLS, evaluate
+
+    events = [
+        {
+            "author": "sub_agent",
+            "content": {
+                "parts": [
+                    {"function_call": {"name": tool_name, "args": {}}},
+                    {
+                        "function_response": {
+                            "name": tool_name,
+                            "response": {"status": "success"},
+                        }
+                    },
+                ]
+            },
+        }
+        for tool_name in REQUIRED_TOOLS
+    ]
+    instance = {"agent_data": {"turns": [{"events": events}]}}
+    verdict = evaluate(instance)
+    assert verdict["score"] == 1.0
+    assert "5/5" in verdict["explanation"]
+

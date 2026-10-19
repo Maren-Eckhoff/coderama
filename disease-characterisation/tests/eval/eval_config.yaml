@@ -1,11 +1,16 @@
 metrics_to_run:
   - custom_response_quality
+  - required_tool_trajectory
+  - agent_turn_count
 
 custom_metrics:
   # Default: local LLM-as-judge (see response_quality.py). Runs in-process via
   # google-genai on Gemini platform (ADC) or Google AI Studio (GEMINI_API_KEY).
   - name: custom_response_quality
     custom_function_file: response_quality.py
+  # Deterministic check that all 5 core biomedical tools executed without error.
+  - name: required_tool_trajectory
+    custom_function_file: trajectory_metrics.py
   - name: agent_turn_count
     custom_function: |
       def evaluate(instance):
