@@ -1330,6 +1330,44 @@ async def save_dossier_artifact(
         tool_context.state["latest_dossier_filename"] = filename
         tool_context.state["latest_dossier_markdown"] = scrubbed_markdown
 
+        existing_index = tool_context.state.get("characterized_diseases_index")
+        index_dict: dict[str, dict[str, Any]] = (
+            dict(existing_index) if isinstance(existing_index, dict) else {}
+        )
+        disease_name = str(
+            tool_context.state.get("canonical_disease_name") or safe_id
+        )
+        icd10_str = str(
+            tool_context.state.get("icd10_codes_str")
+            or "ICD-10: Not mapped in ontology cross-references"
+        )
+        index_dict[safe_id] = {
+            "efo_id": safe_id,
+            "canonical_disease_name": disease_name,
+            "icd10_codes_str": icd10_str,
+            "artifact_filename": filename,
+            "targets_report": str(tool_context.state.get("targets_report") or ""),
+            "treatments_report": str(
+                tool_context.state.get("treatments_report") or ""
+            ),
+            "literature_report": str(
+                tool_context.state.get("literature_report") or ""
+            ),
+            "dossier_markdown": scrubbed_markdown,
+        }
+        tool_context.state["characterized_diseases_index"] = index_dict
+        summary_blocks = [
+            (
+                f"### {entry['canonical_disease_name']} (`{entry['efo_id']}` | {entry['icd10_codes_str']})\n"
+                f"- **Artifact**: `{entry['artifact_filename']}`\n"
+                f"- **Dossier**:\n{entry['dossier_markdown']}"
+            )
+            for entry in index_dict.values()
+        ]
+        tool_context.state["characterized_diseases_summary"] = "\n\n---\n\n".join(
+            summary_blocks
+        )
+
     try:
         part = types.Part(
             inline_data=types.Blob(

@@ -482,12 +482,26 @@ async def test_fetch_recent_publications_enforces_max_5_and_balanced_preprints(
 
 @pytest.mark.asyncio
 async def test_save_dossier_artifact() -> None:
-    """Verify save_dossier_artifact writes artifact and updates session state."""
+    """Verify save_dossier_artifact writes artifact and consolidates multiple diseases in session state."""
     ctx = _DummyToolContext()
-    res = await save_dossier_artifact("EFO_0000768", "# Dossier Content", ctx)  # type: ignore[arg-type]
-    assert res["status"] == "success"
-    assert res["artifact_filename"] == "EFO_0000768_dossier.md"
+    ctx.state["canonical_disease_name"] = "idiopathic pulmonary fibrosis"
+    ctx.state["icd10_codes_str"] = "ICD10:J84.1"
+    res1 = await save_dossier_artifact("EFO_0000768", "# IPF Dossier Content", ctx)  # type: ignore[arg-type]
+    assert res1["status"] == "success"
+    assert res1["artifact_filename"] == "EFO_0000768_dossier.md"
     assert ctx.state["latest_dossier_filename"] == "EFO_0000768_dossier.md"
+
+    ctx.state["canonical_disease_name"] = "Crohn's disease"
+    ctx.state["icd10_codes_str"] = "ICD10:K50"
+    res2 = await save_dossier_artifact("EFO_0000384", "# Crohn Dossier Content", ctx)  # type: ignore[arg-type]
+    assert res2["status"] == "success"
+    assert res2["artifact_filename"] == "EFO_0000384_dossier.md"
+
+    # Both diseases must remain preserved in characterized_diseases_index & summary
+    assert "EFO_0000768" in ctx.state["characterized_diseases_index"]
+    assert "EFO_0000384" in ctx.state["characterized_diseases_index"]
+    assert "# IPF Dossier Content" in ctx.state["characterized_diseases_summary"]
+    assert "# Crohn Dossier Content" in ctx.state["characterized_diseases_summary"]
 
 
 def test_pii_redaction_preserves_biomedical_ids() -> None:

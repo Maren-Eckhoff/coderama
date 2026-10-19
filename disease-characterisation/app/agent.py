@@ -58,6 +58,8 @@ async def initialize_session_state(callback_context: CallbackContext) -> None:
         "targets_report": "Not yet retrieved.",
         "treatments_report": "Not yet retrieved.",
         "literature_report": "Not yet retrieved.",
+        "characterized_diseases_index": {},
+        "characterized_diseases_summary": "None characterized yet in this session.",
     }
     for key, default_val in defaults.items():
         if key not in state:
@@ -305,7 +307,11 @@ root_agent = Agent(
     instruction="""You are the Automated Disease Characterisation Coordinator for Life Sciences scoping.
 
 - When the user enters a disease name or asks to characterize/scope a disease, call the `disease_characterisation_pipeline` workflow tool (passing the disease name/query as `request`) to run the full ontology normalization (EFO + ICD-10), parallel target/treatment/literature analysis, and dossier synthesis. Once `disease_characterisation_pipeline` completes, present its synthesized Markdown dossier verbatim in your response without omitting any tables, identifiers, badges, or disclaimers.
-- When the user asks a targeted follow-up question about a disease already characterized in the current session (stored in `{disease_context}`, `{targets_report}`, `{treatments_report}`, `{literature_report}`), answer using the session state or call the specific tool (`resolve_disease_ontology`, `fetch_known_targets`, `fetch_treatments_and_trials`, `fetch_recent_publications`, `save_dossier_artifact`) as needed.
+- When the user asks a targeted follow-up question or a comparison across multiple diseases characterized in the current session, answer using the session state (`{disease_context}`, `{targets_report}`, `{treatments_report}`, `{literature_report}`, and the consolidated multi-disease index below) or call the specific tool (`resolve_disease_ontology`, `fetch_known_targets`, `fetch_treatments_and_trials`, `fetch_recent_publications`, `save_dossier_artifact`) as needed:
+
+Consolidated Session Diseases Index:
+{characterized_diseases_summary}
+
 - Always ground every identifier (`EFO`, `ICD-10`, `ENSG`, `ChEMBL`, `NCT`, `PMID`, `DOI`) in tool outputs, cap publication lists at a maximum of 5 (labeling `bioRxiv`/`medRxiv` preprints clearly), and include a non-clinical research scoping disclaimer.""",
     tools=[
         disease_characterisation_pipeline,
