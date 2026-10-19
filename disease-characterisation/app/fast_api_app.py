@@ -43,11 +43,13 @@ AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from app.agent import app as adk_app
     from app.agent import root_agent
+    from app.memory import memory_consolidator
 
     runner = Runner(
         app=adk_app,
         session_service=services.get_session_service(),
         artifact_service=services.get_artifact_service(),
+        memory_service=services.get_memory_service(),
         auto_create_session=True,
     )
     app.state.runner = runner
@@ -60,12 +62,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         rpc_path=f"/a2a/{adk_app.name}",
     )
     yield
+    await memory_consolidator.drain_background_tasks()
 
 
 app: FastAPI = get_fast_api_app(
     agents_dir=AGENT_DIR,
     web=True,
     artifact_service_uri=services.ARTIFACT_SERVICE_URI,
+    memory_service_uri=services.MEMORY_SERVICE_URI,
     allow_origins=allow_origins,
     session_service_uri=services.SESSION_SERVICE_URI,
     otel_to_cloud=otel_to_cloud,

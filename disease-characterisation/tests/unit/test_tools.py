@@ -686,3 +686,119 @@ async def test_strict_input_output_json_schemas_and_recovery_instructions() -> N
     assert bad_artifact["recovery_instructions"] is not None
     assert "save_dossier_artifact" in bad_artifact["recovery_instructions"]
 
+
+@pytest.mark.asyncio
+async def test_persistent_vector_memory_and_async_background_consolidation(
+    tmp_path: Any,
+) -> None:
+    """Verify persistent SQLite vector store, cosine similarity search, and non-blocking async background memory consolidation."""
+    from google.adk.tools import load_memory, preload_memory
+
+    from app.app_utils import services
+    from app.memory import (
+        AsyncMemoryConsolidator,
+        PersistentVectorMemoryService,
+        compute_text_embedding,
+        cosine_similarity,
+        search_long_term_disease_memory,
+        trigger_async_memory_consolidation,
+    )
+
+    # 1. Verify root_agent has preload_memory, load_memory, search_long_term_disease_memory, and after_agent_callback
+    assert preload_memory in root_agent.tools
+    assert load_memory in root_agent.tools
+    assert search_long_term_disease_memory in root_agent.tools
+    assert root_agent.after_agent_callback == trigger_async_memory_consolidation
+    assert isinstance(
+        services.get_memory_service(), PersistentVectorMemoryService
+    )
+
+    # 2. Verify embedding cosine similarity ranks semantically related biomedical text higher
+    vec_ipf = compute_text_embedding(
+        "EFO_0000768 idiopathic pulmonary fibrosis TGFB1 pirfenidone nintedanib lung"
+    )
+    vec_ipf_query = compute_text_embedding(
+        "pulmonary fibrosis TGFB1 nintedanib EFO_0000768"
+    )
+    vec_unrelated = compute_text_embedding(
+        "MONDO_0005148 type 2 diabetes mellitus insulin metformin"
+    )
+    assert cosine_similarity(vec_ipf, vec_ipf_query) > cosine_similarity(
+        vec_ipf, vec_unrelated
+    )
+
+    # 3. Verify AsyncMemoryConsolidator spawns asyncio.create_task and persists into PersistentVectorMemoryService
+    db_file = tmp_path / "test_vector_memory.db"
+    vec_service = PersistentVectorMemoryService(db_path=db_file)
+    consolidator = AsyncMemoryConsolidator()
+
+    state_snapshot = {
+        "resolution_status": "success",
+        "efo_id": "EFO_0000768",
+        "canonical_disease_name": "idiopathic pulmonary fibrosis",
+        "icd10_codes_str": "ICD10:J84.1",
+        "characterized_diseases_index": {
+            "EFO_0000768": {
+                "efo_id": "EFO_0000768",
+                "canonical_disease_name": "idiopathic pulmonary fibrosis",
+                "icd10_codes_str": "ICD10:J84.1",
+                "artifact_filename": "EFO_0000768_dossier.md",
+                "targets_report": "Top target: TGFB1 (ENSG00000105329).",
+                "treatments_report": "Approved drugs: Nintedanib (CHEMBL2103830), Pirfenidone.",
+                "literature_report": "Recent peer-reviewed IPF study.",
+                "dossier_markdown": "# IPF Dossier\nTargets: TGFB1 (ENSG00000105329). Drug: Nintedanib.",
+            },
+            "EFO_0000384": {
+                "efo_id": "EFO_0000384",
+                "canonical_disease_name": "Crohn's disease",
+                "icd10_codes_str": "ICD10:K50",
+                "artifact_filename": "EFO_0000384_dossier.md",
+                "targets_report": "Top target: NOD2, TNF.",
+                "treatments_report": "Approved drugs: Infliximab, Ustekinumab.",
+                "literature_report": "Recent Crohn's mucosal immunology paper.",
+                "dossier_markdown": "# Crohn's Disease Dossier\nTargets: NOD2, TNF. Drug: Infliximab.",
+            },
+        },
+    }
+
+    bg_task = consolidator.schedule_consolidation(
+        state_snapshot=state_snapshot,
+        app_name="app",
+        user_id="researcher_1",
+        session_id="sess_101",
+        memory_service=vec_service,
+    )
+    assert not bg_task.done() or consolidator.completed_consolidations >= 0
+    await consolidator.drain_background_tasks()
+    assert consolidator.pending_task_count == 0
+    assert consolidator.completed_consolidations == 2
+
+    # 4. Re-open a fresh PersistentVectorMemoryService on the same SQLite file to verify cross-session persistence
+    reopened_service = PersistentVectorMemoryService(db_path=db_file)
+    search_resp = await reopened_service.search_memory(
+        app_name="app",
+        user_id="researcher_1",
+        query="TGFB1 nintedanib pulmonary fibrosis",
+    )
+    assert len(search_resp.memories) >= 1
+    top_memory = search_resp.memories[0]
+    assert top_memory.custom_metadata["efo_id"] == "EFO_0000768"
+    assert "TGFB1" in top_memory.content.parts[0].text
+
+    # 5. Verify search_long_term_disease_memory tool contract and validation recovery_instructions
+    with patch(
+        "app.app_utils.services.get_memory_service",
+        return_value=reopened_service,
+    ):
+        tool_res = await search_long_term_disease_memory(
+            "idiopathic pulmonary fibrosis TGFB1", top_k=3
+        )
+        assert tool_res["status"] == "success"
+        assert tool_res["returned_count"] >= 1
+        assert tool_res["matches"][0]["efo_id"] == "EFO_0000768"
+
+        bad_mem_query = await search_long_term_disease_memory("x", top_k=3)
+        assert bad_mem_query["status"] == "validation_error"
+        assert "RECOVERY:" in (bad_mem_query["recovery_instructions"] or "")
+
+

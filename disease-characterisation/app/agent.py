@@ -22,12 +22,18 @@ from google.adk.agents.context import Context
 from google.adk.apps.app import App, EventsCompactionConfig
 from google.adk.models import Gemini
 from google.adk.plugins import ReflectAndRetryToolPlugin
+from google.adk.tools import load_memory, preload_memory
 from google.adk.workflow import JoinNode, Workflow
 from google.genai import types
 
 load_dotenv()
 
 from app.app_utils.telemetry import DiseaseObservabilityPlugin
+from app.memory import (
+    get_optional_vertex_ai_search_tools,
+    search_long_term_disease_memory,
+    trigger_async_memory_consolidation,
+)
 from app.tools import (
     fetch_known_targets,
     fetch_recent_publications,
@@ -283,6 +289,7 @@ Recovery Instructions:
 - If `save_dossier_artifact` returns `status="error"`, still output the complete Markdown dossier in your response and note that artifact persistence was skipped.""",
     tools=[save_dossier_artifact],
     output_key="characterisation_dossier",
+    after_agent_callback=trigger_async_memory_consolidation,
 )
 
 disease_characterisation_pipeline = Workflow(
@@ -319,7 +326,7 @@ root_agent = Agent(
     instruction="""You are the Automated Disease Characterisation Coordinator for Life Sciences scoping.
 
 - When the user enters a disease name or asks to characterize/scope a disease, call the `disease_characterisation_pipeline` workflow tool (passing the disease name/query as `request`) to run the full ontology normalization (EFO + ICD-10), parallel target/treatment/literature analysis, and dossier synthesis. Once `disease_characterisation_pipeline` completes, present its synthesized Markdown dossier verbatim in your response without omitting any tables, identifiers, badges, or disclaimers.
-- When the user asks a targeted follow-up question or a comparison across multiple diseases characterized in the current session, answer using the session state (`{disease_context}`, `{targets_report}`, `{treatments_report}`, `{literature_report}`, and the consolidated multi-disease index below) or call the specific tool (`resolve_disease_ontology`, `fetch_known_targets`, `fetch_treatments_and_trials`, `fetch_recent_publications`, `save_dossier_artifact`) as needed:
+- When the user asks a targeted follow-up question or a comparison across multiple diseases characterized in the current session or past sessions, answer using the session state (`{disease_context}`, `{targets_report}`, `{treatments_report}`, `{literature_report}`, and the consolidated multi-disease index below), or retrieve persistent cross-session knowledge using `search_long_term_disease_memory` / `load_memory` (or call the specific live biomedical tool `resolve_disease_ontology`, `fetch_known_targets`, `fetch_treatments_and_trials`, `fetch_recent_publications`, `save_dossier_artifact` as needed):
 
 Consolidated Session Diseases Index:
 {characterized_diseases_summary}
@@ -333,8 +340,13 @@ Consolidated Session Diseases Index:
         fetch_treatments_and_trials,
         fetch_recent_publications,
         save_dossier_artifact,
+        search_long_term_disease_memory,
+        load_memory,
+        preload_memory,
+        *get_optional_vertex_ai_search_tools(),
     ],
     before_agent_callback=initialize_session_state,
+    after_agent_callback=trigger_async_memory_consolidation,
 )
 
 app = App(

@@ -9,7 +9,8 @@ The **Automated Disease Characterisation Agent** accelerates early-stage scoping
 - **Development Mode**: Local prototype first (`--prototype`) with **ADK Web Playground** (`agents-cli playground`)
 - **Target Production Architecture**: **Vertex AI Agent Runtime** (`--deployment-target agent_runtime`) published to **Gemini Enterprise** (`agents-cli publish gemini-enterprise`)
 - **Context Compaction**: Strict sliding-window compaction after every **5 events** (`EventsCompactionConfig(compaction_interval=5, overlap_size=1)`)
-- **Memory**: Session-scoped state (`session.state`) and session-scoped dossier artifacts; no cross-session Memory Bank.
+- **Long-Term Vector Memory & Retrieval**: Persistent vector store (`PersistentVectorMemoryService` backed by SQLite + 256-dim L2-normalized dense embeddings, with automatic delegation to `VertexAiRagMemoryService` (`VERTEX_AI_RAG_CORPUS`), `VertexAiMemoryBankService` (`GOOGLE_CLOUD_AGENT_ENGINE_ID`), and `VertexAiSearchTool` (`VERTEX_AI_SEARCH_DATA_STORE_ID`)), surfaced via `preload_memory`, `load_memory`, and `search_long_term_disease_memory`.
+- **Async Background Memory Consolidation**: Non-blocking `asyncio.create_task` worker pool (`AsyncMemoryConsolidator` triggered via `after_agent_callback=trigger_async_memory_consolidation` and `save_dossier_artifact`) that asynchronously deduplicates, scrubs PII, embeds, and persists consolidated disease dossiers into long-term vector memory without adding user-facing latency.
 
 ---
 
@@ -81,8 +82,11 @@ root_agent (Coordinator LlmAgent)
    - **API**: `https://www.ebi.ac.uk/europepmc/webservices/rest/search`
    - **Authentication**: None (public API).
 
-5. **`save_dossier_artifact(efo_id: str, markdown_content: str, tool_context: ToolContext) -> dict`**
-   - **Purpose**: Persists the synthesized Markdown dossier into the ADK `ArtifactService` (`{efo_id}_dossier.md`) so it can be downloaded in the ADK Web Playground or Gemini Enterprise.
+5. **`save_dossier_artifact(efo_id: str, markdown_content: str, tool_context: ToolContext) -> SaveDossierArtifactOutput`**
+   - **Purpose**: Persists the synthesized Markdown dossier into the ADK `ArtifactService` (`{efo_id}_dossier.md`), updates the in-session multi-disease consolidation index, and schedules a non-blocking `asyncio.create_task` background job (`AsyncMemoryConsolidator`) to embed and store the dossier in long-term vector memory.
+
+6. **`search_long_term_disease_memory(query: str, top_k: int, tool_context: ToolContext) -> SearchLongTermMemoryOutput`** (plus ADK `preload_memory`, `load_memory`, and optional `VertexAiSearchTool`)
+   - **Purpose**: Executes semantic cosine-similarity + lexical hybrid search over the persistent vector store (`PersistentVectorMemoryService` / `VertexAiRagMemoryService` / `VertexAiMemoryBankService`) to retrieve previously consolidated disease dossiers, targets, and trials across sessions.
 
 ---
 

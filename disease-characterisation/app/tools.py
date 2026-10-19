@@ -1728,6 +1728,28 @@ async def save_dossier_artifact(
             summary_blocks
         )
 
+        # Schedule non-blocking async background memory consolidation into the persistent vector store
+        try:
+            from app.memory import memory_consolidator
+
+            state_obj = tool_context.state
+            state_snapshot = (
+                state_obj.to_dict()
+                if hasattr(state_obj, "to_dict")
+                else dict(state_obj)
+            )
+            inv_ctx = getattr(tool_context, "_invocation_context", None)
+            session = getattr(inv_ctx, "session", None)
+            memory_consolidator.schedule_consolidation(
+                state_snapshot=state_snapshot,
+                app_name=getattr(session, "app_name", None) or "app",
+                user_id=getattr(session, "user_id", None) or "default_user",
+                session_id=getattr(session, "id", None),
+                memory_service=getattr(inv_ctx, "memory_service", None),
+            )
+        except Exception as bg_exc:
+            logger.debug("Background memory consolidation schedule skipped: %s", bg_exc)
+
     try:
         part = types.Part(
             inline_data=types.Blob(

@@ -343,3 +343,47 @@ class SaveDossierArtifactOutput(StrictSchemaModel):
         default=None,
         description="Explicit instructions when artifact persistence falls back to session state.",
     )
+
+
+class SearchLongTermMemoryInput(StrictSchemaModel):
+    """Strict input schema for `search_long_term_disease_memory`."""
+
+    query: str = Field(
+        ...,
+        min_length=2,
+        max_length=300,
+        description="Semantic search query (disease name, EFO ID, gene symbol, or therapeutic mechanism) to retrieve from persistent long-term vector memory.",
+    )
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description="Maximum number of long-term memory entries to return (1 to 10).",
+    )
+
+
+class LongTermMemoryMatchItem(StrictSchemaModel):
+    """A single retrieved memory item from the persistent vector store or Vertex AI Search / Memory Bank."""
+
+    memory_id: str | None = None
+    efo_id: str | None = None
+    disease_name: str | None = None
+    timestamp: str | None = None
+    author: str | None = None
+    similarity_score: float | None = Field(default=None, ge=-1.0, le=1.0)
+    content_snippet: str = ""
+
+
+class SearchLongTermMemoryOutput(StrictSchemaModel):
+    """Strict output schema for `search_long_term_disease_memory`."""
+
+    status: Literal["success", "empty", "validation_error", "error"]
+    query: str = ""
+    returned_count: int = Field(default=0, ge=0)
+    matches: list[LongTermMemoryMatchItem] = Field(default_factory=list)
+    message: str | None = None
+    recovery_instructions: str | None = Field(
+        default=None,
+        description="Explicit instructions when no prior long-term memory matches exist for the query.",
+    )
+
