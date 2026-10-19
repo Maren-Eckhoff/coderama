@@ -802,3 +802,97 @@ async def test_persistent_vector_memory_and_async_background_consolidation(
         assert "RECOVERY:" in (bad_mem_query["recovery_instructions"] or "")
 
 
+@pytest.mark.asyncio
+async def test_strategic_model_routing_tiers_and_fallback() -> None:
+    """Verify multi-tier role assignment (FAST_MODEL vs PRO_MODEL), dynamic complexity routing, and fallback."""
+    from google.adk.models.llm_request import LlmRequest
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
+
+    from app.agent import (
+        FAST_MODEL,
+        PRO_MODEL,
+        classify_query_complexity,
+        disease_resolver_agent,
+        dossier_synthesizer_agent,
+        fallback_to_fast_model_on_error,
+        literature_agent,
+        route_model_by_complexity,
+        targets_agent,
+        treatments_agent,
+    )
+
+    # 1. Verify static role-based tiering across sub-agents
+    assert FAST_MODEL != PRO_MODEL
+    for extraction_agent in (
+        disease_resolver_agent,
+        targets_agent,
+        treatments_agent,
+        literature_agent,
+    ):
+        assert extraction_agent.model.model == FAST_MODEL  # type: ignore[union-attr]
+        assert extraction_agent.generate_content_config.temperature == 0.0  # type: ignore[union-attr]
+
+    assert dossier_synthesizer_agent.model.model == PRO_MODEL  # type: ignore[union-attr]
+    assert dossier_synthesizer_agent.generate_content_config.temperature == 0.2  # type: ignore[union-attr]
+    assert (
+        dossier_synthesizer_agent.on_model_error_callback
+        == fallback_to_fast_model_on_error
+    )
+
+    # 2. Verify dynamic complexity router (`route_model_by_complexity`)
+    tier_fast, model_fast, _ = classify_query_complexity("Characterize IPF")
+    assert tier_fast == "fast_extraction"
+    assert model_fast == FAST_MODEL
+
+    tier_pro, model_pro, reason_pro = classify_query_complexity(
+        "Compare the shared targets and unmet need between IPF and Crohn's disease"
+    )
+    assert tier_pro == "deep_synthesis"
+    assert model_pro == PRO_MODEL
+    assert "comparative_or_analytical_intent" in reason_pro
+
+    cb_ctx = MagicMock()
+    cb_ctx.state = {}
+    cb_ctx.agent_name = "disease_characterisation"
+    cb_ctx.user_content = types.Content(
+        role="user",
+        parts=[
+            types.Part.from_text(
+                text="Compare target druggability across IPF vs ulcerative colitis"
+            )
+        ],
+    )
+    req = LlmRequest(model=FAST_MODEL, contents=[])
+    await route_model_by_complexity(cb_ctx, req)
+    assert req.model == PRO_MODEL
+    assert req.config.temperature == 0.2
+    assert cb_ctx.state["last_model_routing"]["tier"] == "deep_synthesis"
+
+    # 3. Verify resilient fallback (`fallback_to_fast_model_on_error`) from PRO_MODEL -> FAST_MODEL
+    expected_fallback_resp = LlmResponse(
+        content=types.Content(
+            role="model",
+            parts=[types.Part.from_text(text="Synthesized fallback dossier")],
+        )
+    )
+
+    async def _fake_generate(request: Any, stream: bool = False):
+        assert request.model == FAST_MODEL
+        yield expected_fallback_resp
+
+    with patch.object(
+        type(dossier_synthesizer_agent.model),
+        "generate_content_async",
+        side_effect=_fake_generate,
+    ):
+        recovered = await fallback_to_fast_model_on_error(
+            cb_ctx,
+            req,
+            RuntimeError("404 Model not available in region"),
+        )
+        assert recovered is expected_fallback_resp
+        assert req.model == FAST_MODEL
+
+
+

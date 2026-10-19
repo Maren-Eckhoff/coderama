@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+import os
+import re
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from google.adk.agents import Agent
@@ -21,14 +23,21 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.agents.context import Context
 from google.adk.apps.app import App, EventsCompactionConfig
 from google.adk.models import Gemini
+from google.adk.models.llm_request import LlmRequest
+from google.adk.models.llm_response import LlmResponse
 from google.adk.plugins import ReflectAndRetryToolPlugin
 from google.adk.tools import load_memory, preload_memory
 from google.adk.workflow import JoinNode, Workflow
 from google.genai import types
+from opentelemetry import trace
 
 load_dotenv()
 
-from app.app_utils.telemetry import DiseaseObservabilityPlugin
+from app.app_utils.telemetry import (
+    DiseaseObservabilityPlugin,
+    get_structured_logger,
+    redact_pii,
+)
 from app.memory import (
     get_optional_vertex_ai_search_tools,
     search_long_term_disease_memory,
@@ -42,7 +51,22 @@ from app.tools import (
     save_dossier_artifact,
 )
 
-MODEL = "gemini-3.8-flash"
+logger = get_structured_logger("disease_characterisation.routing")
+tracer = trace.get_tracer("disease_characterisation.routing")
+
+# Strategic Multi-Tier Model Configuration:
+# - FAST_MODEL ("gemini-3.8-flash"): Low-latency deterministic API tool calling & structured field extraction.
+# - PRO_MODEL ("gemini-3.8-pro"): Deep cross-domain biomedical synthesis & comparative multi-disease reasoning.
+FAST_MODEL = os.environ.get("FAST_MODEL", "gemini-3.8-flash")
+PRO_MODEL = os.environ.get("PRO_MODEL", "gemini-3.8-pro")
+MODEL = FAST_MODEL
+
+_COMPLEX_REASONING_PATTERN = re.compile(
+    r"\b(compare|comparison|versus|vs\.?|overlap|shared|differ|difference|contrast|"
+    r"prioriti[sz]e|rank|unmet\s+need|cross[- ]?indication|synerg\w+|combination|"
+    r"across\s+diseases|between\s+\w+\s+and|why\s+does|white[- ]?space)\b",
+    re.IGNORECASE,
+)
 
 RESEARCH_SCOPING_DISCLAIMER = (
     "\n\n---\n"
@@ -136,17 +160,174 @@ async def unresolved_disease_handler(ctx: Context, node_input: Any) -> str:
     )
 
 
-def _build_model() -> Gemini:
-    """Constructs the Gemini model instance with standard retry options."""
+def _build_model_for_role(
+    role: Literal["extraction", "synthesis", "coordinator"] = "extraction",
+) -> Gemini:
+    """Constructs a role-appropriate Gemini model instance for strategic model routing.
+
+    - `extraction`: Uses `FAST_MODEL` (`gemini-3.8-flash`) for deterministic tool calling and structured extraction.
+    - `synthesis`: Uses `PRO_MODEL` (`gemini-3.8-pro`) for multi-modal cross-domain dossier synthesis.
+    - `coordinator`: Defaults to `FAST_MODEL` and is dynamically upgraded per turn by `route_model_by_complexity`.
+    """
+    selected_model = PRO_MODEL if role == "synthesis" else FAST_MODEL
     return Gemini(
-        model=MODEL,
+        model=selected_model,
         retry_options=types.HttpRetryOptions(attempts=3),
     )
 
 
+def _build_model() -> Gemini:
+    """Default model builder alias returning the fast extraction model."""
+    return _build_model_for_role("extraction")
+
+
+def classify_query_complexity(
+    user_query: str,
+    characterized_diseases_count: int = 0,
+) -> tuple[Literal["fast_extraction", "deep_synthesis"], str, str]:
+    """Classifies user query complexity to select `(routing_tier, model_name, routing_reason)`."""
+    cleaned = redact_pii((user_query or "").strip())
+    word_count = len(cleaned.split())
+    pattern_match = _COMPLEX_REASONING_PATTERN.search(cleaned)
+
+    if pattern_match:
+        matched_term = pattern_match.group(0).lower()
+        return (
+            "deep_synthesis",
+            PRO_MODEL,
+            f"comparative_or_analytical_intent:{matched_term}",
+        )
+    if characterized_diseases_count >= 2 and word_count >= 12:
+        return (
+            "deep_synthesis",
+            PRO_MODEL,
+            f"multi_disease_session_synthesis:count={characterized_diseases_count}",
+        )
+    if word_count >= 30:
+        return (
+            "deep_synthesis",
+            PRO_MODEL,
+            f"high_complexity_prompt:words={word_count}",
+        )
+    return (
+        "fast_extraction",
+        FAST_MODEL,
+        "single_indication_dispatch_or_lookup",
+    )
+
+
+async def route_model_by_complexity(
+    callback_context: CallbackContext,
+    llm_request: LlmRequest,
+) -> LlmResponse | None:
+    """ADK `before_model_callback` that dynamically routes `llm_request.model` based on query complexity."""
+    user_text = ""
+    user_content = getattr(callback_context, "user_content", None)
+    if user_content and getattr(user_content, "parts", None):
+        user_text = " ".join(
+            p.text for p in user_content.parts if getattr(p, "text", None)
+        )
+    elif llm_request.contents:
+        for content in reversed(llm_request.contents):
+            if getattr(content, "role", None) == "user" and getattr(
+                content, "parts", None
+            ):
+                texts = [
+                    p.text for p in content.parts if getattr(p, "text", None)
+                ]
+                if texts:
+                    user_text = " ".join(texts)
+                    break
+
+    state = getattr(callback_context, "state", {}) or {}
+    diseases_index = state.get("characterized_diseases_index")
+    diseases_count = (
+        len(diseases_index) if isinstance(diseases_index, dict) else 0
+    )
+
+    tier, selected_model, reason = classify_query_complexity(
+        user_text,
+        characterized_diseases_count=diseases_count,
+    )
+    llm_request.model = selected_model
+    llm_request.config = llm_request.config or types.GenerateContentConfig()
+    llm_request.config.temperature = 0.2 if tier == "deep_synthesis" else 0.0
+
+    routing_record = {
+        "tier": tier,
+        "model": selected_model,
+        "reason": reason,
+    }
+    try:
+        callback_context.state["last_model_routing"] = routing_record
+    except Exception:
+        pass
+
+    span = trace.get_current_span()
+    if span and span.is_recording():
+        span.set_attribute("gen_ai.model.routing_tier", tier)
+        span.set_attribute("gen_ai.model.selected", selected_model)
+        span.set_attribute("gen_ai.model.routing_reason", reason)
+
+    logger.info(
+        "Strategic model router selected %s (tier=%s, reason=%s)",
+        selected_model,
+        tier,
+        reason,
+        extra={
+            "structured_data": {
+                "event_type": "strategic_model_routing",
+                "agent_name": getattr(callback_context, "agent_name", "root_agent"),
+                "routing_tier": tier,
+                "selected_model": selected_model,
+                "routing_reason": reason,
+            }
+        },
+    )
+    return None
+
+
+async def fallback_to_fast_model_on_error(
+    callback_context: CallbackContext,
+    llm_request: LlmRequest,
+    error: Exception,
+) -> LlmResponse | None:
+    """ADK `on_model_error_callback` providing automatic resilience fallback from `PRO_MODEL` to `FAST_MODEL`."""
+    failed_model = getattr(llm_request, "model", None) or PRO_MODEL
+    if failed_model == FAST_MODEL:
+        return None
+
+    logger.warning(
+        "Model '%s' encountered error (%s); automatically falling back to '%s'",
+        failed_model,
+        error,
+        FAST_MODEL,
+        extra={
+            "structured_data": {
+                "event_type": "model_routing_fallback",
+                "failed_model": failed_model,
+                "fallback_model": FAST_MODEL,
+                "error": str(error),
+            }
+        },
+    )
+    llm_request.model = FAST_MODEL
+    fallback_llm = Gemini(
+        model=FAST_MODEL,
+        retry_options=types.HttpRetryOptions(attempts=3),
+    )
+    last_response: LlmResponse | None = None
+    async for resp in fallback_llm.generate_content_async(
+        llm_request, stream=False
+    ):
+        last_response = resp
+    return last_response
+
+
 disease_resolver_agent = Agent(
     name="disease_resolver_agent",
-    model=_build_model(),
+    model=_build_model_for_role("extraction"),
+    generate_content_config=types.GenerateContentConfig(temperature=0.0),
     description="Resolves a user-entered disease into canonical EFO and ICD-10 ontology identifiers.",
     instruction="""You are the Disease Ontology Normalization Specialist.
 Given the user's disease query:
@@ -166,7 +347,8 @@ Given the user's disease query:
 
 targets_agent = Agent(
     name="targets_agent",
-    model=_build_model(),
+    model=_build_model_for_role("extraction"),
+    generate_content_config=types.GenerateContentConfig(temperature=0.0),
     description="Fetches top known biological targets and tractability evidence for the resolved disease.",
     instruction="""You are the Target Discovery Specialist.
 Structured Ontology Identifiers from Session State:
@@ -192,7 +374,8 @@ Resolved Disease Context:
 
 treatments_agent = Agent(
     name="treatments_agent",
-    model=_build_model(),
+    model=_build_model_for_role("extraction"),
+    generate_content_config=types.GenerateContentConfig(temperature=0.0),
     description="Fetches existing approved/investigational treatments and active clinical trials for the disease.",
     instruction="""You are the Clinical & Therapeutics Landscape Specialist.
 Structured Ontology Identifiers from Session State:
@@ -216,7 +399,8 @@ Resolved Disease Context:
 
 literature_agent = Agent(
     name="literature_agent",
-    model=_build_model(),
+    model=_build_model_for_role("extraction"),
+    generate_content_config=types.GenerateContentConfig(temperature=0.0),
     description="Surfaces up to 5 recent peer-reviewed publications and bioRxiv/medRxiv preprints.",
     instruction="""You are the Biomedical Literature & Preprint Specialist.
 Structured Ontology Identifiers from Session State:
@@ -247,7 +431,8 @@ research_join = JoinNode(
 
 dossier_synthesizer_agent = Agent(
     name="dossier_synthesizer_agent",
-    model=_build_model(),
+    model=_build_model_for_role("synthesis"),
+    generate_content_config=types.GenerateContentConfig(temperature=0.2),
     description="Synthesizes the grounded Disease Characterisation Dossier and saves it as a downloadable artifact.",
     instruction=f"""You are the Lead Life Sciences Scoping Synthesizer.
 Combine the findings from the specialist agents into a clear, executive **Disease Characterisation Dossier**:
@@ -289,6 +474,7 @@ Recovery Instructions:
 - If `save_dossier_artifact` returns `status="error"`, still output the complete Markdown dossier in your response and note that artifact persistence was skipped.""",
     tools=[save_dossier_artifact],
     output_key="characterisation_dossier",
+    on_model_error_callback=fallback_to_fast_model_on_error,
     after_agent_callback=trigger_async_memory_consolidation,
 )
 
@@ -321,7 +507,7 @@ root_agent = Agent(
     # gen_ai.agent.name. Renaming the agent only here makes the two disagree,
     # and anything selecting traces by name stops finding this agent's.
     name="disease_characterisation",
-    model=_build_model(),
+    model=_build_model_for_role("coordinator"),
     description="Automated Disease Characterisation Agent for Life Sciences scoping.",
     instruction="""You are the Automated Disease Characterisation Coordinator for Life Sciences scoping.
 
@@ -346,6 +532,8 @@ Consolidated Session Diseases Index:
         *get_optional_vertex_ai_search_tools(),
     ],
     before_agent_callback=initialize_session_state,
+    before_model_callback=route_model_by_complexity,
+    on_model_error_callback=fallback_to_fast_model_on_error,
     after_agent_callback=trigger_async_memory_consolidation,
 )
 
