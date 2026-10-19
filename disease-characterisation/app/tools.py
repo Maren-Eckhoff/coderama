@@ -18,14 +18,29 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
 from google.adk.tools import ToolContext
 from google.genai import types
 from opentelemetry import trace
+from pydantic import Field, ValidationError
 
 from app.app_utils.telemetry import get_structured_logger, redact_pii
+from app.schemas import (
+    ONTOLOGY_ID_PATTERN,
+    DiseaseOntologyOutput,
+    FetchKnownTargetsInput,
+    FetchRecentPublicationsInput,
+    FetchTreatmentsAndTrialsInput,
+    KnownTargetsOutput,
+    RecentPublicationsOutput,
+    ResolveDiseaseInput,
+    SaveDossierArtifactInput,
+    SaveDossierArtifactOutput,
+    TreatmentsAndTrialsOutput,
+    validate_and_dump,
+)
 
 logger = get_structured_logger("disease_characterisation.tools")
 tracer = trace.get_tracer("disease_characterisation.tools")
@@ -74,7 +89,9 @@ async def _async_request_with_retry(
                 raise
     if last_exc is not None:
         raise last_exc
-    raise RuntimeError(f"HTTP {method} request to {url} failed after {max_attempts} attempts.")
+    raise RuntimeError(
+        f"HTTP {method} request to {url} failed after {max_attempts} attempts."
+    )
 
 
 def _extract_icd10_codes(db_xrefs: list[str]) -> list[str]:
@@ -150,8 +167,6 @@ def _normalize_disease_term(text: str) -> str:
 def _strip_disease_suffixes(norm_text: str) -> str:
     """Strips generic disease/syndrome suffixes from a normalized term."""
     result = norm_text
-    for suffix in _ACRONYM_STOPWORDS:
-        pass
     for suffix in _DISEASE_SUFFIXES:
         if result.endswith(suffix) and len(result) > len(suffix):
             result = result[: -len(suffix)].strip()
@@ -220,8 +235,6 @@ def _rank_disease_candidates(
     reordered = [item[3] for item in scored]
     top_score, _, top_conf, _ = scored[0]
 
-    # A query is ambiguous if multiple candidates exist and the top candidate is only a fuzzy match
-    # (or if two top candidates tied on a non-exact score).
     has_tie = len(scored) >= 2 and scored[0][0] == scored[1][0] and top_score < 95
     is_ambiguous = len(reordered) >= 2 and (
         top_conf == "fuzzy_search_hit" or has_tie
@@ -248,31 +261,63 @@ def _record_unresolved_state(
 
 
 async def resolve_disease_ontology(
-    disease_query: str,
+    disease_query: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=300,
+            description=(
+                "The disease name, medical acronym (e.g., 'IPF', 'NSCLC'), or canonical "
+                "EFO/MONDO identifier (e.g., 'EFO_0000768', 'MONDO_0005148')."
+            ),
+        ),
+    ],
     tool_context: ToolContext,
-) -> dict[str, Any]:
+) -> DiseaseOntologyOutput:
     """Resolves a free-text disease query into canonical EFO and ICD-10 ontology identifiers.
 
-    Supports direct canonical ID lookup (EFO_*, MONDO_*, ORPHA_*, HP_*), deterministic
+    Supports direct canonical ID lookup (`EFO_*`, `MONDO_*`, `ORPHA_*`, `HP_*`), deterministic
     exact-name and synonym/acronym re-ranking, and Human-in-the-Loop (HITL) disambiguation
     when a broad or ambiguous query matches multiple distinct indications.
+
+    Recovery Instructions:
+        - If `status == "validation_error"`: Provide a non-empty `disease_query` (1-300 chars) and retry.
+        - If `status == "not_found"`: Do NOT invent an EFO or ICD-10 code. Retry `resolve_disease_ontology`
+          once using a broader parent indication name or standard medical synonym (removing subtype numerals
+          or punctuation). If still `not_found`, report that the indication is unmapped in Open Targets.
+        - If `status == "ambiguous"`: Do NOT invoke target, treatment, or literature tools yet. Present the
+          returned `candidates` table (`name`, `efo_id`, `description`) and ask the user to confirm or select
+          the desired `efo_id`.
+        - If `status == "error"`: Report the temporary Open Targets API failure and follow `recovery_instructions`.
 
     Args:
         disease_query: The disease name, synonym, acronym, or canonical EFO/MONDO ID entered by the user.
 
     Returns:
-        dict with 'status' ('success', 'ambiguous', 'not_found', or 'error'),
-        'resolution_confidence', 'efo_id', 'name', 'icd10_codes', 'description',
-        'synonyms', 'therapeutic_areas', and 'open_targets_url'.
+        Strict `DiseaseOntologyOutput` dictionary containing `status`, `resolution_confidence`,
+        `efo_id`, `name`, `icd10_codes`, `synonyms`, `therapeutic_areas`, `candidates`, and `recovery_instructions`.
     """
-    cleaned_query = redact_pii((disease_query or "").strip())
-    if not cleaned_query:
-        err_res = {
-            "status": "error",
-            "message": "Disease query cannot be empty.",
-        }
-        _record_unresolved_state(tool_context, "error", "", err_res)
-        return err_res
+    raw_cleaned = redact_pii((disease_query or "").strip())
+    try:
+        validated_in = ResolveDiseaseInput(disease_query=raw_cleaned)
+        cleaned_query = validated_in.disease_query
+    except ValidationError as val_exc:
+        err_res = validate_and_dump(
+            DiseaseOntologyOutput,
+            {
+                "status": "validation_error",
+                "resolution_confidence": "validation_error",
+                "query": raw_cleaned,
+                "message": f"Invalid disease_query input: {val_exc.errors()[0]['msg']}",
+                "recovery_instructions": (
+                    "Call `resolve_disease_ontology` with a non-empty disease name "
+                    "(e.g., 'Idiopathic Pulmonary Fibrosis'), medical acronym ('IPF'), "
+                    "or canonical ontology ID ('EFO_0000768')."
+                ),
+            },
+        )
+        _record_unresolved_state(tool_context, "error", raw_cleaned, err_res)
+        return err_res  # type: ignore[return-value]
 
     parent_span = trace.get_current_span()
     if parent_span and parent_span.is_recording():
@@ -309,7 +354,6 @@ async def resolve_disease_ontology(
     }
     """
 
-    # Check if resuming from an interactive ADK ToolConfirmation
     tool_conf = (
         getattr(tool_context, "tool_confirmation", None)
         if tool_context is not None
@@ -318,20 +362,27 @@ async def resolve_disease_ontology(
     confirmed_efo_override: str | None = None
     if tool_conf is not None:
         if not tool_conf.confirmed:
-            declined_res = {
-                "status": "ambiguous",
-                "resolution_confidence": "disambiguation_declined",
-                "query": cleaned_query,
-                "requires_human_disambiguation": True,
-                "message": (
-                    f"Disambiguation for '{cleaned_query}' was declined. "
-                    "Please provide a specific disease name or canonical EFO_*/MONDO_* identifier."
-                ),
-            }
+            declined_res = validate_and_dump(
+                DiseaseOntologyOutput,
+                {
+                    "status": "ambiguous",
+                    "resolution_confidence": "disambiguation_declined",
+                    "query": cleaned_query,
+                    "requires_human_disambiguation": True,
+                    "message": (
+                        f"Disambiguation for '{cleaned_query}' was declined. "
+                        "Please provide a specific disease name or canonical EFO_*/MONDO_* identifier."
+                    ),
+                    "recovery_instructions": (
+                        "Ask the user to supply the exact disease subtype name or canonical "
+                        "`EFO_*` / `MONDO_*` ID they want to characterize."
+                    ),
+                },
+            )
             _record_unresolved_state(
                 tool_context, "ambiguous", cleaned_query, declined_res
             )
-            return declined_res
+            return declined_res  # type: ignore[return-value]
         payload = tool_conf.payload if isinstance(tool_conf.payload, dict) else {}
         confirmed_efo_override = payload.get("selected_efo_id") or payload.get(
             "default_efo_id"
@@ -379,15 +430,25 @@ async def resolve_disease_ontology(
                     search_span.set_attribute("search.hit_count", len(raw_hits))
 
                 if not raw_hits:
-                    not_found_res = {
-                        "status": "not_found",
-                        "query": cleaned_query,
-                        "message": f"No canonical disease entry found in Open Targets for '{cleaned_query}'.",
-                    }
+                    not_found_res = validate_and_dump(
+                        DiseaseOntologyOutput,
+                        {
+                            "status": "not_found",
+                            "resolution_confidence": "not_found",
+                            "query": cleaned_query,
+                            "message": f"No canonical disease entry found in Open Targets for '{cleaned_query}'.",
+                            "recovery_instructions": (
+                                "Do NOT fabricate an EFO or ICD-10 identifier. If the query contained "
+                                "abbreviations, typos, or narrow subtype qualifiers, retry `resolve_disease_ontology` "
+                                "once with the standard medical name or broader parent disease term. Otherwise, "
+                                "inform the user and request a canonical `EFO_*` or `MONDO_*` ID."
+                            ),
+                        },
+                    )
                     _record_unresolved_state(
                         tool_context, "not_found", cleaned_query, not_found_res
                     )
-                    return not_found_res
+                    return not_found_res  # type: ignore[return-value]
 
                 hits, resolution_confidence, is_ambiguous = _rank_disease_candidates(
                     cleaned_query, raw_hits
@@ -413,15 +474,23 @@ async def resolve_disease_ontology(
                 )
 
             if not disease_obj and confirmed_efo_override:
-                not_found_res = {
-                    "status": "not_found",
-                    "query": cleaned_query,
-                    "message": f"No canonical disease entry found in Open Targets for ID '{efo_id}'.",
-                }
+                not_found_res = validate_and_dump(
+                    DiseaseOntologyOutput,
+                    {
+                        "status": "not_found",
+                        "resolution_confidence": "not_found",
+                        "query": cleaned_query,
+                        "message": f"No canonical disease entry found in Open Targets for ID '{efo_id}'.",
+                        "recovery_instructions": (
+                            f"The ontology ID '{efo_id}' was not found in Open Targets. "
+                            "Retry `resolve_disease_ontology` using the human-readable disease name instead."
+                        ),
+                    },
+                )
                 _record_unresolved_state(
                     tool_context, "not_found", cleaned_query, not_found_res
                 )
-                return not_found_res
+                return not_found_res  # type: ignore[return-value]
 
             synonyms: list[str] = []
             for group in disease_obj.get("synonyms") or []:
@@ -429,7 +498,6 @@ async def resolve_disease_ontology(
                     if term and term not in synonyms:
                         synonyms.append(term)
 
-            # Upgrade confidence if query matches an exact synonym from full DiseaseDetails
             if is_ambiguous and synonyms:
                 q_norm = _normalize_disease_term(cleaned_query)
                 q_core = _strip_disease_suffixes(q_norm)
@@ -451,22 +519,24 @@ async def resolve_disease_ontology(
                 )
 
             therapeutic_areas = [
-                {"id": ta.get("id"), "name": ta.get("name")}
+                {"id": ta.get("id"), "name": str(ta.get("name"))}
                 for ta in (disease_obj.get("therapeuticAreas") or [])
                 if ta.get("name")
             ]
 
             alternative_matches = [
                 {
-                    "efo_id": h.get("id"),
-                    "name": h.get("name"),
-                    "description": (h.get("description") or "")[:160],
+                    "efo_id": str(h.get("id")),
+                    "name": str(h.get("name") or ""),
+                    "description": str(h.get("description") or "")[:160],
                 }
                 for h in hits[1:5]
                 if h.get("id")
             ]
 
-            canonical_name = disease_obj.get("name") or top_hit.get("name")
+            canonical_name = str(
+                disease_obj.get("name") or top_hit.get("name") or cleaned_query
+            )
             icd10_codes_str = (
                 ", ".join(icd10_codes)
                 if icd10_codes
@@ -478,7 +548,7 @@ async def resolve_disease_ontology(
                     {
                         "efo_id": efo_id,
                         "name": canonical_name,
-                        "description": (
+                        "description": str(
                             disease_obj.get("description")
                             or top_hit.get("description")
                             or ""
@@ -506,19 +576,27 @@ async def resolve_disease_ontology(
                         },
                     )
 
-                ambiguous_result = {
-                    "status": "ambiguous",
-                    "resolution_confidence": "ambiguous",
-                    "requires_human_disambiguation": True,
-                    "query": cleaned_query,
-                    "efo_id": efo_id,
-                    "name": canonical_name,
-                    "icd10_codes": icd10_codes,
-                    "candidates": candidate_options,
-                    "alternative_matches": alternative_matches,
-                    "message": hint_msg,
-                    "open_targets_url": f"https://platform.opentargets.org/disease/{efo_id}",
-                }
+                ambiguous_result = validate_and_dump(
+                    DiseaseOntologyOutput,
+                    {
+                        "status": "ambiguous",
+                        "resolution_confidence": "ambiguous",
+                        "requires_human_disambiguation": True,
+                        "query": cleaned_query,
+                        "efo_id": efo_id,
+                        "name": canonical_name,
+                        "icd10_codes": icd10_codes,
+                        "candidates": candidate_options,
+                        "alternative_matches": alternative_matches,
+                        "message": hint_msg,
+                        "open_targets_url": f"https://platform.opentargets.org/disease/{efo_id}",
+                        "recovery_instructions": (
+                            "Present all entries in `candidates` (Disease Name, EFO ID, and Description) "
+                            "to the user and ask them to confirm which specific EFO ID or subtype they "
+                            "want characterized before running target, treatment, or literature lookups."
+                        ),
+                    },
+                )
                 if parent_span and parent_span.is_recording():
                     parent_span.set_attribute("disease.efo_id", efo_id)
                     parent_span.set_attribute(
@@ -531,39 +609,51 @@ async def resolve_disease_ontology(
                     tool_context.state["disease_context"] = ambiguous_result
                     tool_context.state["disease_ontology_record"] = ambiguous_result
                     tool_context.state["efo_id"] = efo_id
-                    tool_context.state["canonical_disease_name"] = str(
-                        canonical_name or cleaned_query
-                    )
+                    tool_context.state["canonical_disease_name"] = canonical_name
                     tool_context.state["icd10_codes"] = icd10_codes
                     tool_context.state["icd10_codes_str"] = icd10_codes_str
-                return ambiguous_result
+                return ambiguous_result  # type: ignore[return-value]
 
-            result = {
-                "status": "success",
-                "resolution_confidence": resolution_confidence,
-                "requires_human_disambiguation": False,
-                "query": cleaned_query,
-                "efo_id": efo_id,
-                "name": canonical_name,
-                "icd10_codes": icd10_codes,
-                "other_xrefs": [
-                    ref
-                    for ref in db_xrefs[:15]
-                    if isinstance(ref, str)
-                    and not ref.upper().startswith(("ICD10:", "ICD10CM:"))
-                ],
-                "description": disease_obj.get("description")
-                or top_hit.get("description")
-                or "",
-                "synonyms": synonyms[:10],
-                "therapeutic_areas": therapeutic_areas,
-                "alternative_matches": alternative_matches,
-                "open_targets_url": f"https://platform.opentargets.org/disease/{efo_id}",
-            }
+            recovery_note = (
+                None
+                if icd10_codes
+                else (
+                    "No ICD-10 cross-reference was mapped in Open Targets or OLS4 for this indication. "
+                    "Explicitly display 'ICD-10: Not mapped in ontology cross-references' in the dossier header."
+                )
+            )
+            result = validate_and_dump(
+                DiseaseOntologyOutput,
+                {
+                    "status": "success",
+                    "resolution_confidence": resolution_confidence,
+                    "requires_human_disambiguation": False,
+                    "query": cleaned_query,
+                    "efo_id": efo_id,
+                    "name": canonical_name,
+                    "icd10_codes": icd10_codes,
+                    "other_xrefs": [
+                        ref
+                        for ref in db_xrefs[:15]
+                        if isinstance(ref, str)
+                        and not ref.upper().startswith(("ICD10:", "ICD10CM:"))
+                    ],
+                    "description": str(
+                        disease_obj.get("description")
+                        or top_hit.get("description")
+                        or ""
+                    ),
+                    "synonyms": synonyms[:10],
+                    "therapeutic_areas": therapeutic_areas,
+                    "alternative_matches": alternative_matches,
+                    "open_targets_url": f"https://platform.opentargets.org/disease/{efo_id}",
+                    "recovery_instructions": recovery_note,
+                },
+            )
 
             if parent_span and parent_span.is_recording():
                 parent_span.set_attribute("disease.efo_id", efo_id)
-                parent_span.set_attribute("disease.name", str(canonical_name or ""))
+                parent_span.set_attribute("disease.name", canonical_name)
                 parent_span.set_attribute("disease.icd10_codes", ",".join(icd10_codes))
                 parent_span.set_attribute(
                     "disease.resolution_confidence", resolution_confidence
@@ -578,45 +668,90 @@ async def resolve_disease_ontology(
                 tool_context.state["disease_context"] = result
                 tool_context.state["disease_ontology_record"] = result
                 tool_context.state["efo_id"] = efo_id
-                tool_context.state["canonical_disease_name"] = str(
-                    canonical_name or cleaned_query
-                )
+                tool_context.state["canonical_disease_name"] = canonical_name
                 tool_context.state["icd10_codes"] = icd10_codes
                 tool_context.state["icd10_codes_str"] = icd10_codes_str
 
-            return result
+            return result  # type: ignore[return-value]
     except Exception as exc:
         logger.exception("Error resolving disease ontology for '%s'", cleaned_query)
-        err_payload = {
-            "status": "error",
-            "query": cleaned_query,
-            "message": f"Failed to resolve disease ontology: {exc}",
-        }
+        err_payload = validate_and_dump(
+            DiseaseOntologyOutput,
+            {
+                "status": "error",
+                "resolution_confidence": "error",
+                "query": cleaned_query,
+                "message": f"Failed to resolve disease ontology: {exc}",
+                "recovery_instructions": (
+                    "Open Targets GraphQL endpoint experienced a transient failure after 3 retries. "
+                    "Do NOT hallucinate EFO or ICD-10 identifiers; report the upstream API error "
+                    "to the user and suggest retrying."
+                ),
+            },
+        )
         _record_unresolved_state(
             tool_context, "error", cleaned_query, err_payload
         )
-        return err_payload
+        return err_payload  # type: ignore[return-value]
 
 
 async def fetch_known_targets(
-    efo_id: str,
-    limit: int,
-) -> dict[str, Any]:
+    efo_id: Annotated[
+        str,
+        Field(
+            min_length=3,
+            max_length=64,
+            pattern=ONTOLOGY_ID_PATTERN,
+            description="Canonical ontology identifier (e.g., 'EFO_0000768' or 'MONDO_0005148').",
+        ),
+    ],
+    limit: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=15,
+            description="Maximum number of top associated targets to return (1 to 15).",
+        ),
+    ] = 10,
+) -> KnownTargetsOutput:
     """Fetches top-ranked known biological targets associated with a disease EFO/MONDO ID from Open Targets.
+
+    Recovery Instructions:
+        - If `status == "validation_error"`: Ensure `efo_id` matches `^(EFO|MONDO|ORPHA|HP|OTAR|DOID)_[0-9]+$`
+          (never pass a free-text disease name as `efo_id`). Call `resolve_disease_ontology` first if needed.
+        - If `status == "not_found"` or `targets` is empty: Do NOT fabricate target symbols or Ensembl IDs.
+          Explicitly state in the dossier that Open Targets currently catalogs 0 target associations for this ID.
+        - If `status == "error"`: Report that the Open Targets target association service experienced a transient
+          error and omit unverified target claims.
 
     Args:
         efo_id: Canonical ontology identifier (e.g., 'EFO_0000768' or 'MONDO_0005148').
         limit: Maximum number of top targets to return (capped between 1 and 15).
 
     Returns:
-        dict with 'status', 'efo_id', 'total_associated_targets', and 'targets' list
-        containing gene symbols, Ensembl IDs, association scores, and tractability.
+        Strict `KnownTargetsOutput` dictionary with `status`, `efo_id`, `total_associated_targets`,
+        `targets` list, and `recovery_instructions`.
     """
-    cleaned_efo = redact_pii((efo_id or "").strip())
-    if not cleaned_efo:
-        return {"status": "error", "message": "efo_id cannot be empty."}
+    raw_efo = redact_pii((efo_id or "").strip())
+    try:
+        validated_in = FetchKnownTargetsInput(efo_id=raw_efo, limit=limit)
+        cleaned_efo = validated_in.efo_id
+        capped_limit = validated_in.limit
+    except ValidationError as val_exc:
+        return validate_and_dump(  # type: ignore[return-value]
+            KnownTargetsOutput,
+            {
+                "status": "validation_error",
+                "efo_id": raw_efo,
+                "message": f"Invalid parameters for fetch_known_targets: {val_exc.errors()[0]['msg']}",
+                "recovery_instructions": (
+                    "Pass a valid canonical ontology ID matching `^(EFO|MONDO|ORPHA|HP|OTAR|DOID)_[0-9]+$` "
+                    "(e.g., 'EFO_0000768') and a positive integer `limit` between 1 and 15. "
+                    "If you only have a disease name, call `resolve_disease_ontology` first."
+                ),
+            },
+        )
 
-    capped_limit = min(max(int(limit), 1), 15)
     parent_span = trace.get_current_span()
     if parent_span and parent_span.is_recording():
         parent_span.set_attribute("disease.efo_id", cleaned_efo)
@@ -672,11 +807,18 @@ async def fetch_known_targets(
                 disease_data = (resp.json().get("data") or {}).get("disease")
 
             if not disease_data:
-                return {
-                    "status": "not_found",
-                    "efo_id": cleaned_efo,
-                    "message": f"No disease found for EFO ID '{cleaned_efo}'.",
-                }
+                return validate_and_dump(  # type: ignore[return-value]
+                    KnownTargetsOutput,
+                    {
+                        "status": "not_found",
+                        "efo_id": cleaned_efo,
+                        "message": f"No disease found for EFO ID '{cleaned_efo}'.",
+                        "recovery_instructions": (
+                            f"Verify the canonical EFO/MONDO ID via `resolve_disease_ontology` before retrying "
+                            f"`fetch_known_targets`. Do not invent target associations."
+                        ),
+                    },
+                )
 
             assoc = disease_data.get("associatedTargets") or {}
             rows = assoc.get("rows") or []
@@ -684,14 +826,14 @@ async def fetch_known_targets(
 
             for row in rows:
                 target_info = row.get("target") or {}
-                ensembl_id = target_info.get("id") or ""
+                ensembl_id = str(target_info.get("id") or "")
                 tractability_items = [
                     f"{t.get('modality')}: {t.get('label')}"
                     for t in (target_info.get("tractability") or [])
                     if t.get("value") is True
                 ]
                 datatype_scores = {
-                    dt.get("id"): round(float(dt.get("score", 0.0)), 4)
+                    str(dt.get("id")): round(float(dt.get("score", 0.0)), 4)
                     for dt in (row.get("datatypeScores") or [])
                     if dt.get("id") is not None
                 }
@@ -710,25 +852,44 @@ async def fetch_known_targets(
                     }
                 )
 
-            total_count = assoc.get("count", len(targets_list))
+            total_count = int(assoc.get("count", len(targets_list)) or 0)
             if parent_span and parent_span.is_recording():
-                parent_span.set_attribute("targets.total_count", int(total_count))
+                parent_span.set_attribute("targets.total_count", total_count)
                 parent_span.set_attribute("targets.returned_count", len(targets_list))
 
-            return {
-                "status": "success",
-                "efo_id": cleaned_efo,
-                "disease_name": disease_data.get("name"),
-                "total_associated_targets": total_count,
-                "targets": targets_list,
-            }
+            empty_recovery = (
+                "Open Targets returned 0 associated targets for this indication. "
+                "State explicitly in the dossier that no validated biological targets are currently "
+                "cataloged in Open Targets—never fabricate gene symbols or Ensembl IDs."
+                if not targets_list
+                else None
+            )
+            return validate_and_dump(  # type: ignore[return-value]
+                KnownTargetsOutput,
+                {
+                    "status": "success",
+                    "efo_id": cleaned_efo,
+                    "disease_name": disease_data.get("name"),
+                    "total_associated_targets": total_count,
+                    "targets": targets_list,
+                    "recovery_instructions": empty_recovery,
+                },
+            )
     except Exception as exc:
         logger.exception("Error fetching known targets for '%s'", cleaned_efo)
-        return {
-            "status": "error",
-            "efo_id": cleaned_efo,
-            "message": f"Failed to fetch known targets: {exc}",
-        }
+        return validate_and_dump(  # type: ignore[return-value]
+            KnownTargetsOutput,
+            {
+                "status": "error",
+                "efo_id": cleaned_efo,
+                "message": f"Failed to fetch known targets: {exc}",
+                "recovery_instructions": (
+                    "Open Targets `associatedTargets` query failed after automatic retries. "
+                    "Report the upstream service error in the Known Biological Targets section "
+                    "and do NOT fabricate gene symbols or Ensembl IDs."
+                ),
+            },
+        )
 
 
 async def _fetch_drugs_via_chembl(
@@ -830,7 +991,7 @@ async def _fetch_drugs_via_chembl(
             results.append(
                 {
                     "drug_name": mol.get("pref_name") or cid,
-                    "chembl_id": cid,
+                    "chembl_id": str(cid),
                     "drug_type": mol.get("molecule_type"),
                     "max_clinical_phase": phase,
                     "trial_status": "Approved"
@@ -847,11 +1008,41 @@ async def _fetch_drugs_via_chembl(
 
 
 async def fetch_treatments_and_trials(
-    efo_id: str,
-    disease_name: str,
-    limit: int,
-) -> dict[str, Any]:
+    efo_id: Annotated[
+        str,
+        Field(
+            min_length=3,
+            max_length=64,
+            pattern=ONTOLOGY_ID_PATTERN,
+            description="Canonical ontology identifier (e.g., 'EFO_0000768' or 'MONDO_0005148').",
+        ),
+    ],
+    disease_name: Annotated[
+        str,
+        Field(
+            min_length=2,
+            max_length=300,
+            description="Canonical disease name for querying ClinicalTrials.gov (e.g., 'Idiopathic Pulmonary Fibrosis').",
+        ),
+    ],
+    limit: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=15,
+            description="Maximum number of drugs and clinical trials to return (1 to 15).",
+        ),
+    ] = 10,
+) -> TreatmentsAndTrialsOutput:
     """Fetches existing approved/investigational drugs from Open Targets / ChEMBL and clinical trials from ClinicalTrials.gov v2.
+
+    Recovery Instructions:
+        - If `status == "validation_error"`: Ensure `efo_id` matches `^(EFO|MONDO|ORPHA|HP|OTAR|DOID)_[0-9]+$`
+          and `disease_name` is a non-empty canonical disease name (at least 2 chars), then retry.
+        - If `partial_warnings` is non-empty: Synthesize the available `known_drugs` or `clinical_trials` that
+          succeeded and note the partial source warning without inventing missing ChEMBL or NCT identifiers.
+        - If both `known_drugs` and `clinical_trials` are empty: State explicitly that no approved/clinical drugs
+          or active studies were found in Open Targets, ChEMBL, or ClinicalTrials.gov—never fabricate drug names or NCT IDs.
 
     Args:
         efo_id: Canonical ontology identifier (e.g., 'EFO_0000768').
@@ -859,12 +1050,34 @@ async def fetch_treatments_and_trials(
         limit: Maximum number of drugs and clinical trials to return (capped between 1 and 15).
 
     Returns:
-        dict with 'status', 'efo_id', 'known_drugs' (ChEMBL ID, drug name, modality, MoA, phase, target),
-        and 'clinical_trials' (NCT ID, title, status, phases, interventions).
+        Strict `TreatmentsAndTrialsOutput` dictionary with `status`, `efo_id`, `known_drugs`,
+        `clinical_trials`, `partial_warnings`, and `recovery_instructions`.
     """
-    cleaned_efo = redact_pii((efo_id or "").strip())
-    cleaned_name = redact_pii((disease_name or "").strip())
-    capped_limit = min(max(int(limit), 1), 15)
+    raw_efo = redact_pii((efo_id or "").strip())
+    raw_name = redact_pii((disease_name or "").strip())
+    try:
+        validated_in = FetchTreatmentsAndTrialsInput(
+            efo_id=raw_efo,
+            disease_name=raw_name,
+            limit=limit,
+        )
+        cleaned_efo = validated_in.efo_id
+        cleaned_name = validated_in.disease_name
+        capped_limit = validated_in.limit
+    except ValidationError as val_exc:
+        return validate_and_dump(  # type: ignore[return-value]
+            TreatmentsAndTrialsOutput,
+            {
+                "status": "validation_error",
+                "efo_id": raw_efo,
+                "disease_name": raw_name,
+                "message": f"Invalid parameters for fetch_treatments_and_trials: {val_exc.errors()[0]['msg']}",
+                "recovery_instructions": (
+                    "Ensure `efo_id` is a valid canonical ID matching `^(EFO|MONDO|ORPHA|HP|OTAR|DOID)_[0-9]+$` "
+                    "(e.g., 'EFO_0000768'), `disease_name` is at least 2 characters, and `limit` is between 1 and 15."
+                ),
+            },
+        )
 
     parent_span = trace.get_current_span()
     if parent_span and parent_span.is_recording():
@@ -934,12 +1147,12 @@ async def fetch_treatments_and_trials(
                         (resp.json().get("data") or {}).get("disease") or {}
                     )
                     kd = disease_data.get("knownDrugs") or {}
-                    unique_drugs_count = kd.get("uniqueDrugs", 0)
+                    unique_drugs_count = int(kd.get("uniqueDrugs", 0) or 0)
 
                     seen_drug_targets: set[tuple[str, str]] = set()
                     for row in kd.get("rows") or []:
-                        drug_id = row.get("drugId") or ""
-                        target_id = row.get("targetId") or ""
+                        drug_id = str(row.get("drugId") or "")
+                        target_id = str(row.get("targetId") or "")
                         key = (drug_id, target_id)
                         if key in seen_drug_targets:
                             continue
@@ -954,7 +1167,7 @@ async def fetch_treatments_and_trials(
                                 "trial_status": row.get("status"),
                                 "mechanism_of_action": row.get("mechanismOfAction"),
                                 "target_symbol": target_obj.get("approvedSymbol"),
-                                "target_ensembl_id": target_id,
+                                "target_ensembl_id": target_id or None,
                                 "chembl_url": f"https://www.ebi.ac.uk/chembl/compound_report_card/{drug_id}/"
                                 if drug_id
                                 else None,
@@ -1014,7 +1227,7 @@ async def fetch_treatments_and_trials(
                         arms_mod = proto.get("armsInterventionsModule") or {}
                         sponsor_mod = proto.get("sponsorCollaboratorsModule") or {}
 
-                        nct_id = id_mod.get("nctId") or ""
+                        nct_id = str(id_mod.get("nctId") or "")
                         interventions = [
                             f"{iv.get('type', 'OTHER')}: {iv.get('name')}"
                             for iv in (arms_mod.get("interventions") or [])
@@ -1025,7 +1238,9 @@ async def fetch_treatments_and_trials(
                                 "nct_id": nct_id,
                                 "title": id_mod.get("briefTitle"),
                                 "overall_status": status_mod.get("overallStatus"),
-                                "phases": design_mod.get("phases") or [],
+                                "phases": [
+                                    str(p) for p in (design_mod.get("phases") or [])
+                                ],
                                 "interventions": interventions[:5],
                                 "lead_sponsor": (
                                     sponsor_mod.get("leadSponsor") or {}
@@ -1052,22 +1267,48 @@ async def fetch_treatments_and_trials(
         parent_span.set_attribute("treatments.trials_count", len(clinical_trials))
 
     if not known_drugs and not clinical_trials and errors:
-        return {
-            "status": "error",
+        return validate_and_dump(  # type: ignore[return-value]
+            TreatmentsAndTrialsOutput,
+            {
+                "status": "error",
+                "efo_id": cleaned_efo,
+                "disease_name": cleaned_name,
+                "partial_warnings": errors,
+                "message": "; ".join(errors),
+                "recovery_instructions": (
+                    "Both drug and clinical trial lookups failed after retries. "
+                    "Do NOT fabricate ChEMBL drug IDs or ClinicalTrials.gov NCT IDs; "
+                    "report the upstream API unavailability in the dossier."
+                ),
+            },
+        )
+
+    recovery_msg: str | None = None
+    if errors:
+        recovery_msg = (
+            "One upstream therapeutics endpoint returned a partial warning (`partial_warnings`). "
+            "Report all successfully retrieved records and note the partial source limitation "
+            "without inventing missing ChEMBL or NCT identifiers."
+        )
+    elif not known_drugs and not clinical_trials:
+        recovery_msg = (
+            "No approved/investigational drugs or clinical trials were found for this indication. "
+            "Explicitly state that 0 drugs and 0 trials are currently cataloged—never fabricate records."
+        )
+
+    return validate_and_dump(  # type: ignore[return-value]
+        TreatmentsAndTrialsOutput,
+        {
+            "status": "success",
             "efo_id": cleaned_efo,
             "disease_name": cleaned_name,
-            "message": "; ".join(errors),
-        }
-
-    return {
-        "status": "success",
-        "efo_id": cleaned_efo,
-        "disease_name": cleaned_name,
-        "unique_known_drugs_count": unique_drugs_count,
-        "known_drugs": known_drugs,
-        "clinical_trials": clinical_trials,
-        "partial_warnings": errors,
-    }
+            "unique_known_drugs_count": unique_drugs_count,
+            "known_drugs": known_drugs,
+            "clinical_trials": clinical_trials,
+            "partial_warnings": errors,
+            "recovery_instructions": recovery_msg,
+        },
+    )
 
 
 def _format_europe_pmc_record(item: dict[str, Any]) -> dict[str, Any]:
@@ -1124,15 +1365,17 @@ def _format_europe_pmc_record(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "title": item.get("title"),
         "authors": item.get("authorString"),
-        "venue": venue,
-        "publication_year": item.get("pubYear"),
+        "venue": str(venue),
+        "publication_year": str(item.get("pubYear"))
+        if item.get("pubYear") is not None
+        else None,
         "first_publication_date": item.get("firstPublicationDate"),
         "publication_type": publication_type,
         "source_badge": source_badge,
         "is_preprint": is_preprint,
-        "pmid": pmid or None,
-        "doi": doi or None,
-        "cited_by_count": item.get("citedByCount", 0),
+        "pmid": str(pmid) if pmid else None,
+        "doi": str(doi) if doi else None,
+        "cited_by_count": int(item.get("citedByCount") or 0),
         "url": url,
         "abstract_snippet": abstract_clean,
     }
@@ -1157,26 +1400,66 @@ def _is_allowed_preprint_item(item: dict[str, Any]) -> bool:
 
 
 async def fetch_recent_publications(
-    disease_name: str,
-    max_results: int,
-) -> dict[str, Any]:
+    disease_name: Annotated[
+        str,
+        Field(
+            min_length=2,
+            max_length=300,
+            description="Canonical disease name to search in Europe PMC (PubMed + bioRxiv/medRxiv).",
+        ),
+    ],
+    max_results: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=5,
+            description="Maximum number of publications to return (strictly capped at <= 5).",
+        ),
+    ] = 5,
+) -> RecentPublicationsOutput:
     """Fetches up to 5 recent peer-reviewed publications (PubMed) and preprints (bioRxiv/medRxiv) for a disease.
 
     Executes concurrent queries for peer-reviewed articles (SRC:MED) and bioRxiv/medRxiv preprints (SRC:PPR)
     and merges them into a balanced list strictly capped at <= 5 publications.
+
+    Recovery Instructions:
+        - If `status == "validation_error"`: Provide a non-empty `disease_name` (>= 2 chars) and `max_results` between 1 and 5.
+        - If `returned_count < 5` (including `0`): Report ONLY the publications returned in `publications`.
+          NEVER fabricate titles, authors, PMIDs, or DOIs to reach 5 papers.
+        - If `status == "error"`: Report that Europe PMC is temporarily unavailable and do NOT invent citations.
 
     Args:
         disease_name: Canonical disease name to search in literature and preprint servers.
         max_results: Maximum number of publications to return (strictly capped at 5; returns fewer if fewer exist).
 
     Returns:
-        dict with 'status', 'disease_name', 'returned_count' (<= 5), and 'publications' list.
+        Strict `RecentPublicationsOutput` dictionary with `status`, `disease_name`,
+        `returned_count` (<= 5), `publications` list, and `recovery_instructions`.
     """
-    cleaned_disease = redact_pii((disease_name or "").strip())
-    if not cleaned_disease:
-        return {"status": "error", "message": "disease_name cannot be empty."}
+    raw_disease = redact_pii((disease_name or "").strip())
+    try:
+        validated_in = FetchRecentPublicationsInput(
+            disease_name=raw_disease,
+            max_results=max_results,
+        )
+        cleaned_disease = validated_in.disease_name
+        capped_max = validated_in.max_results
+    except ValidationError as val_exc:
+        return validate_and_dump(  # type: ignore[return-value]
+            RecentPublicationsOutput,
+            {
+                "status": "validation_error",
+                "disease_name": raw_disease,
+                "returned_count": 0,
+                "publications": [],
+                "message": f"Invalid parameters for fetch_recent_publications: {val_exc.errors()[0]['msg']}",
+                "recovery_instructions": (
+                    "Pass a non-empty canonical `disease_name` (at least 2 characters) and "
+                    "an integer `max_results` between 1 and 5."
+                ),
+            },
+        )
 
-    capped_max = min(max(int(max_results), 1), MAX_PUBLICATIONS_CAP)
     parent_span = trace.get_current_span()
     if parent_span and parent_span.is_recording():
         parent_span.set_attribute("literature.disease_name", cleaned_disease)
@@ -1194,7 +1477,9 @@ async def fetch_recent_publications(
             with tracer.start_as_current_span("ebi.europepmc.search") as epmc_span:
                 epmc_span.set_attribute("literature.disease_name", cleaned_disease)
 
-                async def _run_epmc_query(query_str: str) -> tuple[int, list[dict[str, Any]]]:
+                async def _run_epmc_query(
+                    query_str: str,
+                ) -> tuple[int, list[dict[str, Any]]]:
                     resp = await _async_request_with_retry(
                         client,
                         "GET",
@@ -1233,7 +1518,9 @@ async def fetch_recent_publications(
             seen_keys: set[str] = set()
 
             for item in combined_raw:
-                if (item.get("source") or "").upper() == "PPR" and not _is_allowed_preprint_item(item):
+                if (
+                    item.get("source") or ""
+                ).upper() == "PPR" and not _is_allowed_preprint_item(item):
                     continue
 
                 formatted = _format_europe_pmc_record(item)
@@ -1252,8 +1539,6 @@ async def fetch_recent_publications(
                 else:
                     peer_reviewed_pool.append(formatted)
 
-            # Balanced selection: reserve up to 2 slots for preprints (when capped_max >= 4)
-            # and up to 3 slots for peer-reviewed papers, backfilling from either pool if sparse.
             target_preprints = min(2, capped_max // 2) if capped_max >= 2 else 0
             target_peer = capped_max - target_preprints
 
@@ -1261,16 +1546,20 @@ async def fetch_recent_publications(
             selected_preprints = preprint_pool[:target_preprints]
             publications: list[dict[str, Any]] = []
 
-            # Interleave peer-reviewed and preprint items for readable ordering
             max_len = max(len(selected_peer), len(selected_preprints))
             for idx in range(max_len):
                 if idx < len(selected_peer):
                     publications.append(selected_peer[idx])
-                if idx < len(selected_preprints) and len(publications) < capped_max:
+                if (
+                    idx < len(selected_preprints)
+                    and len(publications) < capped_max
+                ):
                     publications.append(selected_preprints[idx])
 
-            # Backfill remaining slots up to capped_max if one pool had fewer items
-            for extra in peer_reviewed_pool[target_peer:] + preprint_pool[target_preprints:]:
+            for extra in (
+                peer_reviewed_pool[target_peer:]
+                + preprint_pool[target_preprints:]
+            ):
                 if len(publications) >= capped_max:
                     break
                 publications.append(extra)
@@ -1284,40 +1573,111 @@ async def fetch_recent_publications(
                 )
                 parent_span.set_attribute("literature.preprint_count", preprint_count)
 
-            return {
-                "status": "success",
-                "disease_name": cleaned_disease,
-                "max_allowed": MAX_PUBLICATIONS_CAP,
-                "returned_count": len(publications),
-                "includes_preprints_from": ["bioRxiv", "medRxiv"],
-                "publications": publications,
-            }
+            sparse_recovery: str | None = None
+            if len(publications) == 0:
+                sparse_recovery = (
+                    f"Europe PMC returned 0 publications for '{cleaned_disease}'. "
+                    "State explicitly that no indexed recent publications or bioRxiv/medRxiv preprints "
+                    "were found—NEVER invent citations, PMIDs, or DOIs."
+                )
+            elif len(publications) < capped_max:
+                sparse_recovery = (
+                    f"Only {len(publications)} relevant publications exist in Europe PMC for '{cleaned_disease}'. "
+                    f"Present ONLY these {len(publications)} papers and never invent additional references to reach {capped_max}."
+                )
+
+            return validate_and_dump(  # type: ignore[return-value]
+                RecentPublicationsOutput,
+                {
+                    "status": "success",
+                    "disease_name": cleaned_disease,
+                    "max_allowed": MAX_PUBLICATIONS_CAP,
+                    "returned_count": len(publications),
+                    "includes_preprints_from": ["bioRxiv", "medRxiv"],
+                    "publications": publications,
+                    "recovery_instructions": sparse_recovery,
+                },
+            )
     except Exception as exc:
-        logger.exception("Error fetching recent publications for '%s'", cleaned_disease)
-        return {
-            "status": "error",
-            "disease_name": cleaned_disease,
-            "message": f"Failed to fetch recent publications: {exc}",
-        }
+        logger.exception(
+            "Error fetching recent publications for '%s'", cleaned_disease
+        )
+        return validate_and_dump(  # type: ignore[return-value]
+            RecentPublicationsOutput,
+            {
+                "status": "error",
+                "disease_name": cleaned_disease,
+                "returned_count": 0,
+                "publications": [],
+                "message": f"Failed to fetch recent publications: {exc}",
+                "recovery_instructions": (
+                    "Europe PMC REST API experienced a transient error after retries. "
+                    "Do NOT fabricate publications, PMIDs, or DOIs; report the temporary "
+                    "literature service error in the dossier."
+                ),
+            },
+        )
 
 
 async def save_dossier_artifact(
-    efo_id: str,
-    markdown_content: str,
+    efo_id: Annotated[
+        str,
+        Field(
+            min_length=2,
+            max_length=100,
+            description="The canonical EFO/MONDO identifier for the characterized disease.",
+        ),
+    ],
+    markdown_content: Annotated[
+        str,
+        Field(
+            min_length=5,
+            description="Full Markdown text of the Disease Characterisation Dossier.",
+        ),
+    ],
     tool_context: ToolContext,
-) -> dict[str, Any]:
+) -> SaveDossierArtifactOutput:
     """Saves the synthesized Disease Characterisation Dossier as a downloadable Markdown artifact.
+
+    Recovery Instructions:
+        - If `status == "validation_error"`: Provide a non-empty `efo_id` and the complete `markdown_content` string (>= 5 chars).
+        - If `status == "saved_in_session_state"`: The external `ArtifactService` was not initialized, so the
+          dossier was persisted in `session.state['latest_dossier_markdown']` and `characterized_diseases_index`.
+          Do NOT retry `save_dossier_artifact`; simply output the complete Markdown dossier directly to the user.
 
     Args:
         efo_id: The canonical EFO/MONDO identifier for the characterized disease.
         markdown_content: Full Markdown text of the Disease Characterisation Dossier.
 
     Returns:
-        dict with 'status', 'artifact_filename', and 'version'.
+        Strict `SaveDossierArtifactOutput` dictionary with `status`, `artifact_filename`,
+        `version`, and `recovery_instructions`.
     """
-    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", (efo_id or "disease").strip())
+    raw_efo = redact_pii((efo_id or "").strip())
+    raw_md = redact_pii(markdown_content or "")
+    try:
+        validated_in = SaveDossierArtifactInput(
+            efo_id=raw_efo,
+            markdown_content=raw_md,
+        )
+    except ValidationError as val_exc:
+        return validate_and_dump(  # type: ignore[return-value]
+            SaveDossierArtifactOutput,
+            {
+                "status": "validation_error",
+                "artifact_filename": "",
+                "version": 0,
+                "message": f"Invalid parameters for save_dossier_artifact: {val_exc.errors()[0]['msg']}",
+                "recovery_instructions": (
+                    "Call `save_dossier_artifact` with a non-empty `efo_id` (e.g., 'EFO_0000768') "
+                    "and the complete synthesized `markdown_content` string."
+                ),
+            },
+        )
+
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", validated_in.efo_id)
     filename = f"{safe_id}_dossier.md"
-    scrubbed_markdown = redact_pii(markdown_content or "")
+    scrubbed_markdown = validated_in.markdown_content
     content_bytes = scrubbed_markdown.encode("utf-8")
 
     span = trace.get_current_span()
@@ -1375,16 +1735,29 @@ async def save_dossier_artifact(
                 data=content_bytes,
             )
         )
-        version = await tool_context.save_artifact(filename, part)
-        return {
-            "status": "success",
-            "artifact_filename": filename,
-            "version": version,
-        }
+        version = int(await tool_context.save_artifact(filename, part) or 0)
+        return validate_and_dump(  # type: ignore[return-value]
+            SaveDossierArtifactOutput,
+            {
+                "status": "success",
+                "artifact_filename": filename,
+                "version": version,
+                "recovery_instructions": None,
+            },
+        )
     except Exception as exc:
         logger.debug("Artifact service save fallback used: %s", exc)
-        return {
-            "status": "saved_in_session_state",
-            "artifact_filename": filename,
-            "version": 0,
-        }
+        return validate_and_dump(  # type: ignore[return-value]
+            SaveDossierArtifactOutput,
+            {
+                "status": "saved_in_session_state",
+                "artifact_filename": filename,
+                "version": 0,
+                "message": "ArtifactService not configured; dossier saved in session state.",
+                "recovery_instructions": (
+                    "Dossier is already persisted in `session.state['latest_dossier_markdown']` "
+                    "and `characterized_diseases_index`. Do NOT retry `save_dossier_artifact`; "
+                    "present the complete Markdown dossier directly to the user."
+                ),
+            },
+        )

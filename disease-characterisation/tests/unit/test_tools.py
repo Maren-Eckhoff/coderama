@@ -609,3 +609,80 @@ def test_required_tool_trajectory_metric() -> None:
     verdict = evaluate(instance)
     assert verdict["score"] == 1.0
     assert "5/5" in verdict["explanation"]
+
+
+@pytest.mark.asyncio
+async def test_strict_input_output_json_schemas_and_recovery_instructions() -> None:
+    """Verify strict Pydantic input/output JSON schemas, ADK FunctionTool declarations, and explicit recovery_instructions."""
+    from google.adk.tools.function_tool import FunctionTool
+    from pydantic import ValidationError
+
+    from app.schemas import (
+        DiseaseOntologyOutput,
+        KnownTargetsOutput,
+        RecentPublicationsOutput,
+        SaveDossierArtifactOutput,
+        TreatmentsAndTrialsOutput,
+        validate_and_dump,
+    )
+
+    # 1. Verify ADK FunctionTool generates strict parameters_json_schema and response_json_schema
+    for fn, out_model in [
+        (resolve_disease_ontology, DiseaseOntologyOutput),
+        (fetch_known_targets, KnownTargetsOutput),
+        (fetch_treatments_and_trials, TreatmentsAndTrialsOutput),
+        (fetch_recent_publications, RecentPublicationsOutput),
+        (save_dossier_artifact, SaveDossierArtifactOutput),
+    ]:
+        ft = FunctionTool(fn)
+        decl = ft._get_declaration()
+        assert decl is not None
+        assert decl.parameters_json_schema is not None
+        assert decl.response_json_schema is not None
+        # Strict output JSON schema must forbid extra properties
+        assert decl.response_json_schema.get("additionalProperties") is False
+        assert "recovery_instructions" in decl.response_json_schema.get(
+            "properties", {}
+        )
+        # Model-level JSON schema check
+        json_schema = out_model.model_json_schema()
+        assert json_schema.get("additionalProperties") is False
+
+    # 2. Verify extra="forbid" rejects undeclared fields in output validation
+    with pytest.raises(ValidationError):
+        validate_and_dump(
+            KnownTargetsOutput,
+            {
+                "status": "success",
+                "efo_id": "EFO_0000768",
+                "unexpected_extra_field": "forbidden",
+            },
+        )
+
+    # 3. Verify invalid inputs trigger status="validation_error" with actionable recovery_instructions
+    ctx = _DummyToolContext()
+    bad_ontology = await resolve_disease_ontology("x", ctx)  # type: ignore[arg-type]
+    assert bad_ontology["status"] == "validation_error"
+    assert bad_ontology["recovery_instructions"] is not None
+    assert "resolve_disease_ontology" in bad_ontology["recovery_instructions"]
+
+    bad_targets = await fetch_known_targets("INVALID-ID-FORMAT", 10)
+    assert bad_targets["status"] == "validation_error"
+    assert bad_targets["recovery_instructions"] is not None
+    assert "EFO_0000768" in bad_targets["recovery_instructions"]
+
+    bad_treatments = await fetch_treatments_and_trials("INVALID_ID", "IPF", 10)
+    assert bad_treatments["status"] == "validation_error"
+    assert bad_treatments["recovery_instructions"] is not None
+    assert "EFO_0000768" in bad_treatments["recovery_instructions"]
+
+    bad_pubs = await fetch_recent_publications("   ", 5)
+    assert bad_pubs["status"] == "validation_error"
+    assert bad_pubs["recovery_instructions"] is not None
+    assert "disease_name" in bad_pubs["recovery_instructions"]
+
+    bad_artifact = await save_dossier_artifact("EFO_0000768", "too short", ctx)  # type: ignore[arg-type]
+    assert bad_artifact["status"] == "validation_error"
+    assert bad_artifact["recovery_instructions"] is not None
+    assert "save_dossier_artifact" in bad_artifact["recovery_instructions"]
+

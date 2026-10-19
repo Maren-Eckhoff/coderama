@@ -151,7 +151,9 @@ Given the user's disease query:
    - ICD-10 Code(s) (`icd10_codes`; if empty, state 'ICD-10: Not mapped in ontology cross-references')
    - Disease Description, Synonyms, and Therapeutic Areas
    - Open Targets Disease URL
-Never invent EFO or ICD-10 codes that were not returned by the tool.""",
+3. Recovery Instructions:
+   - If the tool returns `status="validation_error"`, `status="not_found"`, `status="ambiguous"`, or `status="error"`, inspect the `recovery_instructions` field in the tool output and follow it explicitly.
+   - If `status="validation_error"` can be fixed by normalizing the query (e.g., stripping stray punctuation), retry once with the cleaned query; otherwise report the `message` and `recovery_instructions` clearly without inventing EFO or ICD-10 codes.""",
     tools=[resolve_disease_ontology],
     output_key="disease_context",
 )
@@ -175,7 +177,9 @@ Resolved Disease Context:
    - Target Name
    - Overall Association Score and key datatype scores (genetic, somatic, known drug, literature, pathways)
    - Positive Tractability / Druggability modalities (Small Molecule, Antibody, PROTAC, etc.)
-Never fabricate target symbols, Ensembl IDs, or scores.""",
+3. Recovery Instructions:
+   - If `fetch_known_targets` returns `status="validation_error"`, verify `efo_id` uses underscore format (e.g., `EFO_0000768` rather than `EFO:0000768`) and `limit` is between 1 and 25, then retry once.
+   - If `fetch_known_targets` returns `status="not_found"`, `status="error"`, or an empty `targets` list, follow the `recovery_instructions` field in the tool output and state clearly that no target associations were returned by Open Targets rather than fabricating target symbols, Ensembl IDs, or scores.""",
     tools=[fetch_known_targets],
     output_key="targets_report",
 )
@@ -197,7 +201,9 @@ Resolved Disease Context:
 2. Summarize:
    - Approved and investigational drugs (`drug_name`, `chembl_id`, modality `drug_type`, `max_clinical_phase`, `mechanism_of_action`, and `target_symbol`)
    - Active or recent clinical trials from ClinicalTrials.gov (`nct_id`, `title`, `phases`, `overall_status`, `interventions`, and `lead_sponsor`)
-Never fabricate ChEMBL IDs, drug names, or NCT trial identifiers.""",
+3. Recovery Instructions:
+   - If `fetch_treatments_and_trials` returns `status="validation_error"`, normalize `efo_id` to underscore format and ensure `disease_name` is non-empty and `limit` is between 1 and 25, then retry once.
+   - If `warnings` or `recovery_instructions` are present in the tool output (for example, partial upstream degradation or zero drugs/trials for a rare indication), follow `recovery_instructions` and explicitly note the missing or degraded source without fabricating ChEMBL IDs, drug names, or NCT trial identifiers.""",
     tools=[fetch_treatments_and_trials],
     output_key="treatments_report",
 )
@@ -220,7 +226,10 @@ Resolved Disease Context:
    - Source badge: `[Peer-Reviewed]` or `[Preprint - bioRxiv]` / `[Preprint - medRxiv]`
    - Title, Authors, Venue/Server, and Publication Year
    - Identifier (`PMID` and/or `DOI`) and URL
-   - Concise abstract takeaway.""",
+   - Concise abstract takeaway.
+4. Recovery Instructions:
+   - If `fetch_recent_publications` returns `status="validation_error"`, ensure `disease_name` is non-empty and `max_results` is between 1 and 5, then retry once.
+   - If `returned_count == 0` or `recovery_instructions` indicates a narrower subtype name returned no hits, retry once using the broader parent disease name or primary synonym from `{disease_context}`. If still empty or `status="error"`, report the unavailability transparently without fabricating PMIDs or DOIs.""",
     tools=[fetch_recent_publications],
     output_key="literature_report",
 )
@@ -268,7 +277,10 @@ Structure your Markdown response with these exact sections:
 6. **Research Scoping Disclaimer**:
    - End with: {RESEARCH_SCOPING_DISCLAIMER.strip()}
 
-Finally, call `save_dossier_artifact` with `efo_id="{{efo_id}}"` and the complete Markdown dossier text, and present the full Markdown dossier to the user.""",
+Finally, call `save_dossier_artifact` with `efo_id="{{efo_id}}"` and the complete Markdown dossier text, and present the full Markdown dossier to the user.
+Recovery Instructions:
+- If `save_dossier_artifact` returns `status="validation_error"`, follow its `recovery_instructions` (ensure `efo_id` matches the canonical ID and `markdown_content` contains the full Markdown dossier of at least 20 characters) and retry once.
+- If `save_dossier_artifact` returns `status="error"`, still output the complete Markdown dossier in your response and note that artifact persistence was skipped.""",
     tools=[save_dossier_artifact],
     output_key="characterisation_dossier",
 )
@@ -312,6 +324,7 @@ root_agent = Agent(
 Consolidated Session Diseases Index:
 {characterized_diseases_summary}
 
+- Recovery Instructions: When calling any tool directly, inspect its `status` and `recovery_instructions` fields. If `status="validation_error"`, correct the input arguments according to `recovery_instructions` and retry once. If `status="ambiguous"` or `status="not_found"`, surface the `recovery_instructions` or candidate disambiguation table to the user rather than guessing identifiers.
 - Always ground every identifier (`EFO`, `ICD-10`, `ENSG`, `ChEMBL`, `NCT`, `PMID`, `DOI`) in tool outputs, cap publication lists at a maximum of 5 (labeling `bioRxiv`/`medRxiv` preprints clearly), and include a non-clinical research scoping disclaimer.""",
     tools=[
         disease_characterisation_pipeline,
