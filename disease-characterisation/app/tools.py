@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 
@@ -39,6 +40,41 @@ EUROPE_PMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search
 
 DEFAULT_TIMEOUT_SECONDS = 20.0
 MAX_PUBLICATIONS_CAP = 5
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+async def _async_request_with_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    max_attempts: int = 3,
+    **kwargs: Any,
+) -> httpx.Response:
+    """Executes an async HTTP request with exponential backoff on transient 429/5xx errors."""
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if method.upper() == "POST":
+                resp = await client.post(url, **kwargs)
+            else:
+                resp = await client.get(url, **kwargs)
+            if (
+                resp.status_code in RETRYABLE_STATUS_CODES
+                and attempt < max_attempts
+            ):
+                await asyncio.sleep(0.3 * (2 ** (attempt - 1)))
+                continue
+            return resp
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_exc = exc
+            if attempt < max_attempts:
+                await asyncio.sleep(0.3 * (2 ** (attempt - 1)))
+            else:
+                raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"HTTP {method} request to {url} failed after {max_attempts} attempts.")
 
 
 def _extract_icd10_codes(db_xrefs: list[str]) -> list[str]:
@@ -58,8 +94,8 @@ def _extract_icd10_codes(db_xrefs: list[str]) -> list[str]:
     return icd10_codes
 
 
-def _lookup_icd10_via_ols4(
-    disease_name: str, efo_id: str, client: httpx.Client
+async def _lookup_icd10_via_ols4(
+    disease_name: str, efo_id: str, client: httpx.AsyncClient
 ) -> list[str]:
     """Fallback lookup of ICD-10 cross-references via the EBI OLS4 REST API."""
     icd10_codes: list[str] = []
@@ -67,7 +103,9 @@ def _lookup_icd10_via_ols4(
     with tracer.start_as_current_span("ebi.ols4.icd10_fallback") as span:
         span.set_attribute("disease.efo_id", efo_id)
         try:
-            resp = client.get(
+            resp = await _async_request_with_retry(
+                client,
+                "GET",
                 EBI_OLS4_SEARCH_URL,
                 params={
                     "q": efo_id if efo_id else disease_name,
@@ -95,25 +133,146 @@ def _lookup_icd10_via_ols4(
     return icd10_codes
 
 
-def resolve_disease_ontology(
+_DIRECT_ONTOLOGY_ID_RE = re.compile(
+    r"^(EFO|MONDO|ORPHA|Orphanet|HP|OTAR|DOID)[:_](\d+)$", re.IGNORECASE
+)
+_DISEASE_SUFFIXES = (" disease", " syndrome", " disorder", " condition")
+_ACRONYM_STOPWORDS = {"of", "the", "and", "in", "with", "or", "by", "for"}
+
+
+def _normalize_disease_term(text: str) -> str:
+    """Normalizes a disease string for deterministic comparison."""
+    lowered = (text or "").lower().replace("’s", "").replace("'s", "")
+    cleaned = re.sub(r"[^a-z0-9]+", " ", lowered)
+    return " ".join(cleaned.split())
+
+
+def _strip_disease_suffixes(norm_text: str) -> str:
+    """Strips generic disease/syndrome suffixes from a normalized term."""
+    result = norm_text
+    for suffix in _ACRONYM_STOPWORDS:
+        pass
+    for suffix in _DISEASE_SUFFIXES:
+        if result.endswith(suffix) and len(result) > len(suffix):
+            result = result[: -len(suffix)].strip()
+    return result
+
+
+def _compute_acronym(text: str) -> str:
+    """Computes standard initial-letter acronym from a disease name (including hyphenated parts)."""
+    tokens = re.findall(r"[a-zA-Z0-9]+", (text or "").lower())
+    filtered = [t for t in tokens if t not in _ACRONYM_STOPWORDS]
+    return "".join(t[0] for t in filtered if t)
+
+
+def _rank_disease_candidates(
+    query: str, hits: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], str, bool]:
+    """Re-ranks candidate disease hits and detects whether the query is ambiguous.
+
+    Returns:
+        tuple of (reordered_hits, resolution_confidence, is_ambiguous)
+    """
+    if not hits:
+        return [], "not_found", False
+
+    q_norm = _normalize_disease_term(query)
+    q_core = _strip_disease_suffixes(q_norm)
+    q_upper_id = query.strip().replace(":", "_").upper()
+
+    scored: list[tuple[int, int, str, dict[str, Any]]] = []
+    for idx, hit in enumerate(hits):
+        hit_id = str(hit.get("id") or "")
+        hit_name = str(hit.get("name") or "")
+        h_norm = _normalize_disease_term(hit_name)
+        h_core = _strip_disease_suffixes(h_norm)
+        h_acronym = _compute_acronym(hit_name)
+
+        synonym_terms: list[str] = []
+        for syn in hit.get("synonyms") or []:
+            if isinstance(syn, str):
+                synonym_terms.append(syn)
+            elif isinstance(syn, dict):
+                synonym_terms.extend(syn.get("terms") or [])
+        syn_norms = {_normalize_disease_term(s) for s in synonym_terms if s}
+        syn_cores = {_strip_disease_suffixes(s) for s in syn_norms if s}
+
+        if hit_id.upper() == q_upper_id:
+            score, conf = 100, "direct_id"
+        elif h_norm == q_norm or (q_core and h_core == q_core):
+            score, conf = 95, "exact_name"
+        elif (
+            q_norm in syn_norms
+            or (q_core and q_core in syn_cores)
+            or (len(q_norm) >= 2 and h_acronym == q_norm)
+        ):
+            score, conf = 90, "exact_synonym"
+        elif len(q_core.split()) >= 2 and all(
+            tok in h_norm.split() for tok in q_core.split()
+        ):
+            score, conf = 85, "high_token_match"
+        else:
+            score, conf = 50 - idx, "fuzzy_search_hit"
+
+        scored.append((score, -idx, conf, hit))
+
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    reordered = [item[3] for item in scored]
+    top_score, _, top_conf, _ = scored[0]
+
+    # A query is ambiguous if multiple candidates exist and the top candidate is only a fuzzy match
+    # (or if two top candidates tied on a non-exact score).
+    has_tie = len(scored) >= 2 and scored[0][0] == scored[1][0] and top_score < 95
+    is_ambiguous = len(reordered) >= 2 and (
+        top_conf == "fuzzy_search_hit" or has_tie
+    )
+    return reordered, top_conf, is_ambiguous
+
+
+def _record_unresolved_state(
+    tool_context: ToolContext | None,
+    status: str,
+    query: str,
+    payload: dict[str, Any],
+) -> None:
+    """Writes structured state keys when disease ontology resolution fails or returns no match."""
+    if tool_context is not None and hasattr(tool_context, "state"):
+        tool_context.state["resolution_status"] = status
+        tool_context.state["efo_id"] = "Not yet resolved."
+        tool_context.state["canonical_disease_name"] = query
+        tool_context.state["icd10_codes"] = []
+        tool_context.state["icd10_codes_str"] = (
+            "ICD-10: Not mapped in ontology cross-references"
+        )
+        tool_context.state["disease_ontology_record"] = payload
+
+
+async def resolve_disease_ontology(
     disease_query: str,
     tool_context: ToolContext,
 ) -> dict[str, Any]:
     """Resolves a free-text disease query into canonical EFO and ICD-10 ontology identifiers.
 
+    Supports direct canonical ID lookup (EFO_*, MONDO_*, ORPHA_*, HP_*), deterministic
+    exact-name and synonym/acronym re-ranking, and Human-in-the-Loop (HITL) disambiguation
+    when a broad or ambiguous query matches multiple distinct indications.
+
     Args:
-        disease_query: The disease name, synonym, or acronym entered by the user (e.g., 'Idiopathic Pulmonary Fibrosis', 'NSCLC', 'Crohn disease').
+        disease_query: The disease name, synonym, acronym, or canonical EFO/MONDO ID entered by the user.
 
     Returns:
-        dict with 'status', 'efo_id', 'name', 'icd10_codes', 'description',
+        dict with 'status' ('success', 'ambiguous', 'not_found', or 'error'),
+        'resolution_confidence', 'efo_id', 'name', 'icd10_codes', 'description',
         'synonyms', 'therapeutic_areas', and 'open_targets_url'.
     """
     cleaned_query = redact_pii((disease_query or "").strip())
     if not cleaned_query:
-        return {
+        err_res = {
             "status": "error",
             "message": "Disease query cannot be empty.",
         }
+        _record_unresolved_state(tool_context, "error", "", err_res)
+        return err_res
 
     parent_span = trace.get_current_span()
     if parent_span and parent_span.is_recording():
@@ -150,42 +309,100 @@ def resolve_disease_ontology(
     }
     """
 
+    # Check if resuming from an interactive ADK ToolConfirmation
+    tool_conf = (
+        getattr(tool_context, "tool_confirmation", None)
+        if tool_context is not None
+        else None
+    )
+    confirmed_efo_override: str | None = None
+    if tool_conf is not None:
+        if not tool_conf.confirmed:
+            declined_res = {
+                "status": "ambiguous",
+                "resolution_confidence": "disambiguation_declined",
+                "query": cleaned_query,
+                "requires_human_disambiguation": True,
+                "message": (
+                    f"Disambiguation for '{cleaned_query}' was declined. "
+                    "Please provide a specific disease name or canonical EFO_*/MONDO_* identifier."
+                ),
+            }
+            _record_unresolved_state(
+                tool_context, "ambiguous", cleaned_query, declined_res
+            )
+            return declined_res
+        payload = tool_conf.payload if isinstance(tool_conf.payload, dict) else {}
+        confirmed_efo_override = payload.get("selected_efo_id") or payload.get(
+            "default_efo_id"
+        )
+
+    direct_match = _DIRECT_ONTOLOGY_ID_RE.match(cleaned_query)
+    if direct_match:
+        prefix = direct_match.group(1).upper()
+        if prefix == "ORPHANET":
+            prefix = "ORPHA"
+        confirmed_efo_override = f"{prefix}_{direct_match.group(2)}"
+
     try:
-        with httpx.Client(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
-            with tracer.start_as_current_span(
-                "opentargets.graphql.search_disease"
-            ) as search_span:
-                search_span.set_attribute("graphql.operation", "SearchDisease")
-                search_span.set_attribute("disease.query", cleaned_query)
-                search_resp = client.post(
-                    OPEN_TARGETS_GRAPHQL_URL,
-                    json={
-                        "query": search_gql,
-                        "variables": {"queryString": cleaned_query},
-                    },
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
+            hits: list[dict[str, Any]] = []
+            resolution_confidence = "direct_id"
+            is_ambiguous = False
+
+            if confirmed_efo_override:
+                efo_id = confirmed_efo_override
+                top_hit: dict[str, Any] = {"id": efo_id, "name": cleaned_query}
+                if tool_conf is not None and tool_conf.confirmed:
+                    resolution_confidence = "human_confirmed"
+            else:
+                with tracer.start_as_current_span(
+                    "opentargets.graphql.search_disease"
+                ) as search_span:
+                    search_span.set_attribute("graphql.operation", "SearchDisease")
+                    search_span.set_attribute("disease.query", cleaned_query)
+                    search_resp = await _async_request_with_retry(
+                        client,
+                        "POST",
+                        OPEN_TARGETS_GRAPHQL_URL,
+                        json={
+                            "query": search_gql,
+                            "variables": {"queryString": cleaned_query},
+                        },
+                    )
+                    search_span.set_attribute(
+                        "http.status_code", search_resp.status_code
+                    )
+                    search_resp.raise_for_status()
+                    search_data = search_resp.json().get("data", {}) or {}
+                    raw_hits = (search_data.get("search") or {}).get("hits") or []
+                    search_span.set_attribute("search.hit_count", len(raw_hits))
+
+                if not raw_hits:
+                    not_found_res = {
+                        "status": "not_found",
+                        "query": cleaned_query,
+                        "message": f"No canonical disease entry found in Open Targets for '{cleaned_query}'.",
+                    }
+                    _record_unresolved_state(
+                        tool_context, "not_found", cleaned_query, not_found_res
+                    )
+                    return not_found_res
+
+                hits, resolution_confidence, is_ambiguous = _rank_disease_candidates(
+                    cleaned_query, raw_hits
                 )
-                search_span.set_attribute("http.status_code", search_resp.status_code)
-                search_resp.raise_for_status()
-                search_data = search_resp.json().get("data", {}) or {}
-                hits = (search_data.get("search") or {}).get("hits") or []
-                search_span.set_attribute("search.hit_count", len(hits))
-
-            if not hits:
-                return {
-                    "status": "not_found",
-                    "query": cleaned_query,
-                    "message": f"No canonical disease entry found in Open Targets for '{cleaned_query}'.",
-                }
-
-            top_hit = hits[0]
-            efo_id = top_hit["id"]
+                top_hit = hits[0]
+                efo_id = top_hit["id"]
 
             with tracer.start_as_current_span(
                 "opentargets.graphql.disease_details"
             ) as details_span:
                 details_span.set_attribute("graphql.operation", "DiseaseDetails")
                 details_span.set_attribute("disease.efo_id", efo_id)
-                details_resp = client.post(
+                details_resp = await _async_request_with_retry(
+                    client,
+                    "POST",
                     OPEN_TARGETS_GRAPHQL_URL,
                     json={"query": details_gql, "variables": {"efoId": efo_id}},
                 )
@@ -195,22 +412,43 @@ def resolve_disease_ontology(
                     (details_resp.json().get("data") or {}).get("disease") or {}
                 )
 
-            db_xrefs = disease_obj.get("dbXRefs") or []
-            icd10_codes = _extract_icd10_codes(db_xrefs)
-            ols4_fallback_used = False
-            if not icd10_codes:
-                ols4_fallback_used = True
-                icd10_codes = _lookup_icd10_via_ols4(
-                    disease_obj.get("name") or top_hit.get("name") or cleaned_query,
-                    efo_id,
-                    client,
+            if not disease_obj and confirmed_efo_override:
+                not_found_res = {
+                    "status": "not_found",
+                    "query": cleaned_query,
+                    "message": f"No canonical disease entry found in Open Targets for ID '{efo_id}'.",
+                }
+                _record_unresolved_state(
+                    tool_context, "not_found", cleaned_query, not_found_res
                 )
+                return not_found_res
 
             synonyms: list[str] = []
             for group in disease_obj.get("synonyms") or []:
                 for term in group.get("terms") or []:
                     if term and term not in synonyms:
                         synonyms.append(term)
+
+            # Upgrade confidence if query matches an exact synonym from full DiseaseDetails
+            if is_ambiguous and synonyms:
+                q_norm = _normalize_disease_term(cleaned_query)
+                q_core = _strip_disease_suffixes(q_norm)
+                syn_norms = {_normalize_disease_term(s) for s in synonyms}
+                syn_cores = {_strip_disease_suffixes(s) for s in syn_norms}
+                if q_norm in syn_norms or (q_core and q_core in syn_cores):
+                    resolution_confidence = "exact_synonym"
+                    is_ambiguous = False
+
+            db_xrefs = disease_obj.get("dbXRefs") or []
+            icd10_codes = _extract_icd10_codes(db_xrefs)
+            ols4_fallback_used = False
+            if not icd10_codes:
+                ols4_fallback_used = True
+                icd10_codes = await _lookup_icd10_via_ols4(
+                    disease_obj.get("name") or top_hit.get("name") or cleaned_query,
+                    efo_id,
+                    client,
+                )
 
             therapeutic_areas = [
                 {"id": ta.get("id"), "name": ta.get("name")}
@@ -219,14 +457,91 @@ def resolve_disease_ontology(
             ]
 
             alternative_matches = [
-                {"efo_id": h.get("id"), "name": h.get("name")}
-                for h in hits[1:4]
+                {
+                    "efo_id": h.get("id"),
+                    "name": h.get("name"),
+                    "description": (h.get("description") or "")[:160],
+                }
+                for h in hits[1:5]
                 if h.get("id")
             ]
 
             canonical_name = disease_obj.get("name") or top_hit.get("name")
+            icd10_codes_str = (
+                ", ".join(icd10_codes)
+                if icd10_codes
+                else "ICD-10: Not mapped in ontology cross-references"
+            )
+
+            if is_ambiguous:
+                candidate_options = [
+                    {
+                        "efo_id": efo_id,
+                        "name": canonical_name,
+                        "description": (
+                            disease_obj.get("description")
+                            or top_hit.get("description")
+                            or ""
+                        )[:160],
+                    },
+                    *alternative_matches,
+                ]
+                hint_msg = (
+                    f"The disease query '{cleaned_query}' is ambiguous and matches "
+                    f"{len(candidate_options)} distinct indications. Please confirm "
+                    f"'{canonical_name}' ({efo_id}) or specify one of the candidate EFO IDs."
+                )
+                if (
+                    tool_context is not None
+                    and getattr(tool_context, "function_call_id", None)
+                    and hasattr(tool_context, "request_confirmation")
+                ):
+                    tool_context.request_confirmation(
+                        hint=hint_msg,
+                        payload={
+                            "query": cleaned_query,
+                            "default_efo_id": efo_id,
+                            "default_name": canonical_name,
+                            "candidates": candidate_options,
+                        },
+                    )
+
+                ambiguous_result = {
+                    "status": "ambiguous",
+                    "resolution_confidence": "ambiguous",
+                    "requires_human_disambiguation": True,
+                    "query": cleaned_query,
+                    "efo_id": efo_id,
+                    "name": canonical_name,
+                    "icd10_codes": icd10_codes,
+                    "candidates": candidate_options,
+                    "alternative_matches": alternative_matches,
+                    "message": hint_msg,
+                    "open_targets_url": f"https://platform.opentargets.org/disease/{efo_id}",
+                }
+                if parent_span and parent_span.is_recording():
+                    parent_span.set_attribute("disease.efo_id", efo_id)
+                    parent_span.set_attribute(
+                        "disease.resolution_confidence", "ambiguous"
+                    )
+                if tool_context is not None and hasattr(tool_context, "state"):
+                    tool_context.state["resolution_status"] = "ambiguous"
+                    tool_context.state["resolution_confidence"] = "ambiguous"
+                    tool_context.state["ambiguous_candidates"] = candidate_options
+                    tool_context.state["disease_context"] = ambiguous_result
+                    tool_context.state["disease_ontology_record"] = ambiguous_result
+                    tool_context.state["efo_id"] = efo_id
+                    tool_context.state["canonical_disease_name"] = str(
+                        canonical_name or cleaned_query
+                    )
+                    tool_context.state["icd10_codes"] = icd10_codes
+                    tool_context.state["icd10_codes_str"] = icd10_codes_str
+                return ambiguous_result
+
             result = {
                 "status": "success",
+                "resolution_confidence": resolution_confidence,
+                "requires_human_disambiguation": False,
                 "query": cleaned_query,
                 "efo_id": efo_id,
                 "name": canonical_name,
@@ -251,25 +566,39 @@ def resolve_disease_ontology(
                 parent_span.set_attribute("disease.name", str(canonical_name or ""))
                 parent_span.set_attribute("disease.icd10_codes", ",".join(icd10_codes))
                 parent_span.set_attribute(
+                    "disease.resolution_confidence", resolution_confidence
+                )
+                parent_span.set_attribute(
                     "disease.ols4_fallback_used", ols4_fallback_used
                 )
 
             if tool_context is not None and hasattr(tool_context, "state"):
+                tool_context.state["resolution_status"] = "success"
+                tool_context.state["resolution_confidence"] = resolution_confidence
                 tool_context.state["disease_context"] = result
+                tool_context.state["disease_ontology_record"] = result
                 tool_context.state["efo_id"] = efo_id
+                tool_context.state["canonical_disease_name"] = str(
+                    canonical_name or cleaned_query
+                )
                 tool_context.state["icd10_codes"] = icd10_codes
+                tool_context.state["icd10_codes_str"] = icd10_codes_str
 
             return result
     except Exception as exc:
         logger.exception("Error resolving disease ontology for '%s'", cleaned_query)
-        return {
+        err_payload = {
             "status": "error",
             "query": cleaned_query,
             "message": f"Failed to resolve disease ontology: {exc}",
         }
+        _record_unresolved_state(
+            tool_context, "error", cleaned_query, err_payload
+        )
+        return err_payload
 
 
-def fetch_known_targets(
+async def fetch_known_targets(
     efo_id: str,
     limit: int,
 ) -> dict[str, Any]:
@@ -323,13 +652,15 @@ def fetch_known_targets(
     """
 
     try:
-        with httpx.Client(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
             with tracer.start_as_current_span(
                 "opentargets.graphql.associated_targets"
             ) as ot_span:
                 ot_span.set_attribute("graphql.operation", "AssociatedTargets")
                 ot_span.set_attribute("disease.efo_id", cleaned_efo)
-                resp = client.post(
+                resp = await _async_request_with_retry(
+                    client,
+                    "POST",
                     OPEN_TARGETS_GRAPHQL_URL,
                     json={
                         "query": targets_gql,
@@ -400,14 +731,16 @@ def fetch_known_targets(
         }
 
 
-def _fetch_drugs_via_chembl(
-    efo_id: str, limit: int, client: httpx.Client
+async def _fetch_drugs_via_chembl(
+    efo_id: str, limit: int, client: httpx.AsyncClient
 ) -> list[dict[str, Any]]:
     """Fallback lookup for approved/clinical drugs via EBI ChEMBL REST API."""
     colon_efo = efo_id.replace("_", ":")
     with tracer.start_as_current_span("ebi.chembl.fallback") as span:
         span.set_attribute("disease.efo_id", efo_id)
-        resp = client.get(
+        resp = await _async_request_with_retry(
+            client,
+            "GET",
             CHEMBL_DRUG_INDICATION_URL,
             params={
                 "efo_id": colon_efo,
@@ -422,7 +755,6 @@ def _fetch_drugs_via_chembl(
             span.set_attribute("chembl.drugs_returned", 0)
             return []
 
-        # Sort by max_phase_for_ind descending so Phase 4 (Approved) drugs appear first
         indications.sort(
             key=lambda x: float(x.get("max_phase_for_ind") or 0),
             reverse=True,
@@ -448,39 +780,47 @@ def _fetch_drugs_via_chembl(
         mol_map: dict[str, dict[str, Any]] = {}
         mech_map: dict[str, dict[str, Any]] = {}
 
-        try:
-            mol_resp = client.get(
-                CHEMBL_MOLECULE_URL,
-                params={
-                    "molecule_chembl_id__in": ids_csv,
-                    "limit": len(selected_chembl_ids),
-                    "format": "json",
-                },
-            )
-            mol_resp.raise_for_status()
-            for mol in mol_resp.json().get("molecules") or []:
-                cid = mol.get("molecule_chembl_id")
-                if cid:
-                    mol_map[cid] = mol
-        except Exception as exc:
-            logger.debug("ChEMBL molecule metadata lookup failed: %s", exc)
+        async def _load_molecules() -> None:
+            try:
+                mol_resp = await _async_request_with_retry(
+                    client,
+                    "GET",
+                    CHEMBL_MOLECULE_URL,
+                    params={
+                        "molecule_chembl_id__in": ids_csv,
+                        "limit": len(selected_chembl_ids),
+                        "format": "json",
+                    },
+                )
+                mol_resp.raise_for_status()
+                for mol in mol_resp.json().get("molecules") or []:
+                    cid = mol.get("molecule_chembl_id")
+                    if cid:
+                        mol_map[cid] = mol
+            except Exception as exc:
+                logger.debug("ChEMBL molecule metadata lookup failed: %s", exc)
 
-        try:
-            mech_resp = client.get(
-                CHEMBL_MECHANISM_URL,
-                params={
-                    "molecule_chembl_id__in": ids_csv,
-                    "limit": len(selected_chembl_ids) * 2,
-                    "format": "json",
-                },
-            )
-            mech_resp.raise_for_status()
-            for mech in mech_resp.json().get("mechanisms") or []:
-                cid = mech.get("molecule_chembl_id")
-                if cid and cid not in mech_map:
-                    mech_map[cid] = mech
-        except Exception as exc:
-            logger.debug("ChEMBL mechanism lookup failed: %s", exc)
+        async def _load_mechanisms() -> None:
+            try:
+                mech_resp = await _async_request_with_retry(
+                    client,
+                    "GET",
+                    CHEMBL_MECHANISM_URL,
+                    params={
+                        "molecule_chembl_id__in": ids_csv,
+                        "limit": len(selected_chembl_ids) * 2,
+                        "format": "json",
+                    },
+                )
+                mech_resp.raise_for_status()
+                for mech in mech_resp.json().get("mechanisms") or []:
+                    cid = mech.get("molecule_chembl_id")
+                    if cid and cid not in mech_map:
+                        mech_map[cid] = mech
+            except Exception as exc:
+                logger.debug("ChEMBL mechanism lookup failed: %s", exc)
+
+        await asyncio.gather(_load_molecules(), _load_mechanisms())
 
         results: list[dict[str, Any]] = []
         for cid in selected_chembl_ids:
@@ -506,7 +846,7 @@ def _fetch_drugs_via_chembl(
         return results
 
 
-def fetch_treatments_and_trials(
+async def fetch_treatments_and_trials(
     efo_id: str,
     disease_name: str,
     limit: int,
@@ -564,16 +904,21 @@ def fetch_treatments_and_trials(
     errors: list[str] = []
     chembl_fallback_used = False
 
-    with httpx.Client(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
-        # 1. Fetch known drugs from Open Targets (with ChEMBL REST fallback)
-        if cleaned_efo:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
+
+        async def _fetch_drugs_branch() -> None:
+            nonlocal known_drugs, unique_drugs_count, chembl_fallback_used
+            if not cleaned_efo:
+                return
             try:
                 with tracer.start_as_current_span(
                     "opentargets.graphql.known_drugs"
                 ) as kd_span:
                     kd_span.set_attribute("graphql.operation", "KnownDrugs")
                     kd_span.set_attribute("disease.efo_id", cleaned_efo)
-                    resp = client.post(
+                    resp = await _async_request_with_retry(
+                        client,
+                        "POST",
                         OPEN_TARGETS_GRAPHQL_URL,
                         json={
                             "query": drugs_gql,
@@ -632,7 +977,7 @@ def fetch_treatments_and_trials(
                     },
                 )
                 try:
-                    known_drugs = _fetch_drugs_via_chembl(
+                    known_drugs = await _fetch_drugs_via_chembl(
                         cleaned_efo, capped_limit, client
                     )
                     unique_drugs_count = len(known_drugs)
@@ -640,14 +985,17 @@ def fetch_treatments_and_trials(
                     logger.warning("ChEMBL fallback query failed: %s", chembl_exc)
                     errors.append(f"Known drugs lookup error: {chembl_exc}")
 
-        # 2. Fetch active/recent studies from ClinicalTrials.gov v2
-        if cleaned_name:
+        async def _fetch_trials_branch() -> None:
+            if not cleaned_name:
+                return
             try:
                 with tracer.start_as_current_span(
                     "clinicaltrials.gov.v2.studies"
                 ) as ct_span:
                     ct_span.set_attribute("disease.name", cleaned_name)
-                    ct_resp = client.get(
+                    ct_resp = await _async_request_with_retry(
+                        client,
+                        "GET",
                         CLINICAL_TRIALS_API_URL,
                         params={
                             "query.cond": cleaned_name,
@@ -693,6 +1041,8 @@ def fetch_treatments_and_trials(
             except Exception as exc:
                 logger.warning("ClinicalTrials.gov API v2 query failed: %s", exc)
                 errors.append(f"ClinicalTrials.gov error: {exc}")
+
+        await asyncio.gather(_fetch_drugs_branch(), _fetch_trials_branch())
 
     if parent_span and parent_span.is_recording():
         parent_span.set_attribute(
@@ -788,11 +1138,32 @@ def _format_europe_pmc_record(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def fetch_recent_publications(
+def _is_allowed_preprint_item(item: dict[str, Any]) -> bool:
+    """Checks whether a PPR item is from bioRxiv or medRxiv."""
+    pub_text = (
+        f"{item.get('journalTitle', '')} "
+        f"{(item.get('bookOrReportDetails') or {}).get('publisher', '')} "
+        f"{item.get('doi', '')}"
+    ).lower()
+    return any(
+        tok in pub_text
+        for tok in (
+            "biorxiv",
+            "medrxiv",
+            "cold spring harbor",
+            "10.1101/",
+        )
+    )
+
+
+async def fetch_recent_publications(
     disease_name: str,
     max_results: int,
 ) -> dict[str, Any]:
     """Fetches up to 5 recent peer-reviewed publications (PubMed) and preprints (bioRxiv/medRxiv) for a disease.
+
+    Executes concurrent queries for peer-reviewed articles (SRC:MED) and bioRxiv/medRxiv preprints (SRC:PPR)
+    and merges them into a balanced list strictly capped at <= 5 publications.
 
     Args:
         disease_name: Canonical disease name to search in literature and preprint servers.
@@ -810,73 +1181,60 @@ def fetch_recent_publications(
     if parent_span and parent_span.is_recording():
         parent_span.set_attribute("literature.disease_name", cleaned_disease)
 
-    # Query Europe PMC for both peer-reviewed (SRC:MED) and bioRxiv/medRxiv preprints (SRC:PPR)
-    combined_query = (
-        f'TITLE_ABS:"{cleaned_disease}" AND '
-        f'(SRC:MED OR (SRC:PPR AND (PUBLISHER:"bioRxiv" OR PUBLISHER:"medRxiv" '
-        f'OR PUBLISHER:"Cold Spring Harbor Laboratory")))'
+    med_query = f'TITLE_ABS:"{cleaned_disease}" AND SRC:MED'
+    ppr_query = (
+        f'TITLE_ABS:"{cleaned_disease}" AND SRC:PPR AND '
+        f'(PUBLISHER:"bioRxiv" OR PUBLISHER:"medRxiv" '
+        f'OR PUBLISHER:"Cold Spring Harbor Laboratory")'
     )
     fallback_query = f'"{cleaned_disease}" AND (SRC:MED OR SRC:PPR)'
 
     try:
-        with httpx.Client(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
             with tracer.start_as_current_span("ebi.europepmc.search") as epmc_span:
                 epmc_span.set_attribute("literature.disease_name", cleaned_disease)
-                resp = client.get(
-                    EUROPE_PMC_SEARCH_URL,
-                    params={
-                        "query": combined_query,
-                        "format": "json",
-                        "resultType": "core",
-                        "pageSize": capped_max * 2,
-                        "sort": "FIRST_PDATE_D desc",
-                    },
-                )
-                epmc_span.set_attribute("http.status_code", resp.status_code)
-                resp.raise_for_status()
-                data = resp.json()
-                total_hit_count = int(data.get("hitCount") or 0)
-                raw_results = (data.get("resultList") or {}).get("result") or []
 
-                if not raw_results:
-                    fallback_resp = client.get(
+                async def _run_epmc_query(query_str: str) -> tuple[int, list[dict[str, Any]]]:
+                    resp = await _async_request_with_retry(
+                        client,
+                        "GET",
                         EUROPE_PMC_SEARCH_URL,
                         params={
-                            "query": fallback_query,
+                            "query": query_str,
                             "format": "json",
                             "resultType": "core",
                             "pageSize": capped_max * 2,
                             "sort": "FIRST_PDATE_D desc",
                         },
                     )
-                    fallback_resp.raise_for_status()
-                    fb_data = fallback_resp.json()
-                    total_hit_count = int(fb_data.get("hitCount") or 0)
-                    raw_results = (
-                        (fb_data.get("resultList") or {}).get("result") or []
-                    )
+                    epmc_span.set_attribute("http.status_code", resp.status_code)
+                    resp.raise_for_status()
+                    payload = resp.json()
+                    hits = int(payload.get("hitCount") or 0)
+                    items = (payload.get("resultList") or {}).get("result") or []
+                    return hits, items
+
+                (med_hits, med_items), (ppr_hits, ppr_items) = await asyncio.gather(
+                    _run_epmc_query(med_query),
+                    _run_epmc_query(ppr_query),
+                )
+                total_hit_count = med_hits + ppr_hits
+                combined_raw = list(med_items) + list(ppr_items)
+
+                if not combined_raw:
+                    fb_hits, fb_items = await _run_epmc_query(fallback_query)
+                    total_hit_count = fb_hits
+                    combined_raw = list(fb_items)
+
                 epmc_span.set_attribute("literature.total_hit_count", total_hit_count)
 
-            publications: list[dict[str, Any]] = []
+            peer_reviewed_pool: list[dict[str, Any]] = []
+            preprint_pool: list[dict[str, Any]] = []
             seen_keys: set[str] = set()
-            for item in raw_results:
-                # Filter out non-bioRxiv/medRxiv preprints if source is PPR
-                if (item.get("source") or "").upper() == "PPR":
-                    pub_text = (
-                        f"{item.get('journalTitle', '')} "
-                        f"{(item.get('bookOrReportDetails') or {}).get('publisher', '')} "
-                        f"{item.get('doi', '')}"
-                    ).lower()
-                    if not any(
-                        tok in pub_text
-                        for tok in (
-                            "biorxiv",
-                            "medrxiv",
-                            "cold spring harbor",
-                            "10.1101/",
-                        )
-                    ):
-                        continue
+
+            for item in combined_raw:
+                if (item.get("source") or "").upper() == "PPR" and not _is_allowed_preprint_item(item):
+                    continue
 
                 formatted = _format_europe_pmc_record(item)
                 dedup_key = (
@@ -888,10 +1246,36 @@ def fetch_recent_publications(
                 if dedup_key in seen_keys:
                     continue
                 seen_keys.add(dedup_key)
-                publications.append(formatted)
+
+                if formatted.get("is_preprint"):
+                    preprint_pool.append(formatted)
+                else:
+                    peer_reviewed_pool.append(formatted)
+
+            # Balanced selection: reserve up to 2 slots for preprints (when capped_max >= 4)
+            # and up to 3 slots for peer-reviewed papers, backfilling from either pool if sparse.
+            target_preprints = min(2, capped_max // 2) if capped_max >= 2 else 0
+            target_peer = capped_max - target_preprints
+
+            selected_peer = peer_reviewed_pool[:target_peer]
+            selected_preprints = preprint_pool[:target_preprints]
+            publications: list[dict[str, Any]] = []
+
+            # Interleave peer-reviewed and preprint items for readable ordering
+            max_len = max(len(selected_peer), len(selected_preprints))
+            for idx in range(max_len):
+                if idx < len(selected_peer):
+                    publications.append(selected_peer[idx])
+                if idx < len(selected_preprints) and len(publications) < capped_max:
+                    publications.append(selected_preprints[idx])
+
+            # Backfill remaining slots up to capped_max if one pool had fewer items
+            for extra in peer_reviewed_pool[target_peer:] + preprint_pool[target_preprints:]:
                 if len(publications) >= capped_max:
                     break
+                publications.append(extra)
 
+            publications = publications[:capped_max]
             preprint_count = sum(1 for p in publications if p.get("is_preprint"))
             if parent_span and parent_span.is_recording():
                 parent_span.set_attribute("literature.total_hit_count", total_hit_count)

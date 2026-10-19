@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 from dotenv import load_dotenv
 from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
+from google.adk.agents.context import Context
 from google.adk.apps.app import App, EventsCompactionConfig
 from google.adk.models import Gemini
 from google.adk.plugins import ReflectAndRetryToolPlugin
@@ -47,6 +50,10 @@ async def initialize_session_state(callback_context: CallbackContext) -> None:
     """Initializes session state keys so template placeholders always resolve."""
     state = callback_context.state
     defaults = {
+        "resolution_status": "pending",
+        "efo_id": "Not yet resolved.",
+        "canonical_disease_name": "Not yet resolved.",
+        "icd10_codes_str": "Not yet resolved.",
         "disease_context": "Not yet resolved.",
         "targets_report": "Not yet retrieved.",
         "treatments_report": "Not yet retrieved.",
@@ -55,6 +62,70 @@ async def initialize_session_state(callback_context: CallbackContext) -> None:
     for key, default_val in defaults.items():
         if key not in state:
             state[key] = default_val
+
+
+async def check_ontology_resolution(ctx: Context, node_input: Any) -> str:
+    """Routes workflow execution based on whether disease ontology resolution succeeded, is ambiguous, or failed."""
+    status = str(ctx.state.get("resolution_status") or "")
+    efo_id = str(ctx.state.get("efo_id") or "")
+    if status == "success" and efo_id and efo_id != "Not yet resolved.":
+        ctx.route = "resolved"
+    elif status == "ambiguous":
+        ctx.route = "ambiguous"
+    else:
+        ctx.route = "unresolved"
+    return str(node_input or "")
+
+
+async def ambiguous_disease_handler(ctx: Context, node_input: Any) -> str:
+    """Human-in-the-Loop disambiguation gate when a query matches multiple candidate indications."""
+    candidates = ctx.state.get("ambiguous_candidates") or []
+    rows = []
+    for cand in candidates:
+        if isinstance(cand, dict):
+            c_name = cand.get("name") or "Unknown"
+            c_efo = cand.get("efo_id") or "N/A"
+            c_desc = (cand.get("description") or "No description available.").replace(
+                "\n", " "
+            )
+            rows.append(f"| **{c_name}** | `{c_efo}` | {c_desc} |")
+
+    table_md = ""
+    if rows:
+        table_md = (
+            "\n\n| Candidate Indication | Canonical EFO / MONDO ID | Description |\n"
+            "| :--- | :--- | :--- |\n"
+            + "\n".join(rows)
+        )
+
+    summary = str(
+        node_input
+        or ctx.state.get("disease_context")
+        or "Multiple candidate indications matched your query."
+    )
+    return (
+        "### Human-in-the-Loop Disambiguation Required\n\n"
+        f"{summary}"
+        f"{table_md}\n\n"
+        "**Next Step:** Please reply with the specific **Candidate Indication Name** or "
+        "canonical **`EFO_*` / `MONDO_*` ID** from the table above that you would like to characterize."
+        f"{RESEARCH_SCOPING_DISCLAIMER}"
+    )
+
+
+async def unresolved_disease_handler(ctx: Context, node_input: Any) -> str:
+    """Short-circuits the pipeline when a disease cannot be resolved in Open Targets."""
+    summary = str(
+        node_input
+        or ctx.state.get("disease_context")
+        or "The requested disease could not be resolved."
+    )
+    return (
+        "### Disease Ontology Resolution Unsuccessful\n\n"
+        f"{summary}\n\n"
+        "Please check the spelling of the indication, supply a recognized medical synonym, "
+        f"or provide a canonical `EFO_*` / `MONDO_*` identifier.{RESEARCH_SCOPING_DISCLAIMER}"
+    )
 
 
 def _build_model() -> Gemini:
@@ -88,10 +159,15 @@ targets_agent = Agent(
     model=_build_model(),
     description="Fetches top known biological targets and tractability evidence for the resolved disease.",
     instruction="""You are the Target Discovery Specialist.
-Using the resolved disease context below:
+Structured Ontology Identifiers from Session State:
+- Canonical EFO ID: `{efo_id}`
+- Canonical Disease Name: `{canonical_disease_name}`
+- ICD-10 Code(s): `{icd10_codes_str}`
+
+Resolved Disease Context:
 {disease_context}
 
-1. Extract the canonical `efo_id` and call `fetch_known_targets(efo_id=..., limit=10)`.
+1. Call `fetch_known_targets(efo_id="{efo_id}", limit=10)` using the exact canonical `efo_id` above.
 2. Summarize the top associated biological targets including:
    - Gene Symbol and Ensembl ID (`ENSG...`)
    - Target Name
@@ -107,10 +183,15 @@ treatments_agent = Agent(
     model=_build_model(),
     description="Fetches existing approved/investigational treatments and active clinical trials for the disease.",
     instruction="""You are the Clinical & Therapeutics Landscape Specialist.
-Using the resolved disease context below:
+Structured Ontology Identifiers from Session State:
+- Canonical EFO ID: `{efo_id}`
+- Canonical Disease Name: `{canonical_disease_name}`
+- ICD-10 Code(s): `{icd10_codes_str}`
+
+Resolved Disease Context:
 {disease_context}
 
-1. Extract the canonical `efo_id` and canonical disease `name`, then call `fetch_treatments_and_trials(efo_id=..., disease_name=..., limit=10)`.
+1. Call `fetch_treatments_and_trials(efo_id="{efo_id}", disease_name="{canonical_disease_name}", limit=10)` using the exact canonical `efo_id` and `canonical_disease_name` above.
 2. Summarize:
    - Approved and investigational drugs (`drug_name`, `chembl_id`, modality `drug_type`, `max_clinical_phase`, `mechanism_of_action`, and `target_symbol`)
    - Active or recent clinical trials from ClinicalTrials.gov (`nct_id`, `title`, `phases`, `overall_status`, `interventions`, and `lead_sponsor`)
@@ -124,10 +205,14 @@ literature_agent = Agent(
     model=_build_model(),
     description="Surfaces up to 5 recent peer-reviewed publications and bioRxiv/medRxiv preprints.",
     instruction="""You are the Biomedical Literature & Preprint Specialist.
-Using the resolved disease context below:
+Structured Ontology Identifiers from Session State:
+- Canonical EFO ID: `{efo_id}`
+- Canonical Disease Name: `{canonical_disease_name}`
+
+Resolved Disease Context:
 {disease_context}
 
-1. Extract the canonical disease `name` and call `fetch_recent_publications(disease_name=..., max_results=5)`.
+1. Call `fetch_recent_publications(disease_name="{canonical_disease_name}", max_results=5)` using the exact canonical disease name above.
 2. Report AT MOST 5 publications (if the tool returns fewer than 5, report only those returned—never invent papers to reach 5).
 3. For each publication, preserve:
    - Source badge: `[Peer-Reviewed]` or `[Preprint - bioRxiv]` / `[Preprint - medRxiv]`
@@ -150,6 +235,11 @@ dossier_synthesizer_agent = Agent(
     instruction=f"""You are the Lead Life Sciences Scoping Synthesizer.
 Combine the findings from the specialist agents into a clear, executive **Disease Characterisation Dossier**:
 
+- **Structured Ontology Identifiers**:
+  - Canonical Disease Name: `{{canonical_disease_name}}`
+  - Canonical EFO ID: `{{efo_id}}`
+  - ICD-10 Code(s): `{{icd10_codes_str}}`
+
 - **Disease Ontology Context**:
 {{disease_context}}
 
@@ -164,7 +254,7 @@ Combine the findings from the specialist agents into a clear, executive **Diseas
 
 Structure your Markdown response with these exact sections:
 1. **Disease Ontology & Normalization Header**:
-   - Render a prominent summary table at the very top showing **Disease Name**, **EFO ID**, **ICD-10 Code(s)**, **Therapeutic Areas**, and **Open Targets Link**.
+   - Render a prominent summary table at the very top showing **Disease Name** (`{{canonical_disease_name}}`), **EFO ID** (`{{efo_id}}`), **ICD-10 Code(s)** (`{{icd10_codes_str}}`), **Therapeutic Areas**, and **Open Targets Link**.
 2. **Executive Scoping Summary**:
    - 2-3 sentences summarizing the disease biology, target landscape, and therapeutic maturity.
 3. **Known Biological Targets**:
@@ -176,19 +266,27 @@ Structure your Markdown response with these exact sections:
 6. **Research Scoping Disclaimer**:
    - End with: {RESEARCH_SCOPING_DISCLAIMER.strip()}
 
-Finally, call `save_dossier_artifact` with the `efo_id` and the complete Markdown dossier text, and present the full Markdown dossier to the user.""",
+Finally, call `save_dossier_artifact` with `efo_id="{{efo_id}}"` and the complete Markdown dossier text, and present the full Markdown dossier to the user.""",
     tools=[save_dossier_artifact],
     output_key="characterisation_dossier",
 )
 
 disease_characterisation_pipeline = Workflow(
     name="disease_characterisation_pipeline",
-    description="Executes full disease characterisation: ontology normalization (EFO + ICD-10), parallel research across targets, treatments, and literature/preprints, and dossier synthesis.",
+    description="Executes full disease characterisation: ontology normalization (EFO + ICD-10), conditional short-circuit/HITL disambiguation check, parallel research across targets, treatments, and literature/preprints, and dossier synthesis.",
     input_schema=str,
     edges=[
         (
             "START",
             disease_resolver_agent,
+            check_ontology_resolution,
+            {
+                "resolved": (targets_agent, treatments_agent, literature_agent),
+                "ambiguous": ambiguous_disease_handler,
+                "unresolved": unresolved_disease_handler,
+            },
+        ),
+        (
             (targets_agent, treatments_agent, literature_agent),
             research_join,
             dossier_synthesizer_agent,

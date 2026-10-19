@@ -12,20 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for biomedical API tool contracts and ADK app configuration."""
+"""Unit tests for biomedical API tool contracts and ADK Workflow orchestration."""
 
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.agent import (
     app,
+    check_ontology_resolution,
     disease_characterisation_pipeline,
     research_join,
     root_agent,
+    unresolved_disease_handler,
 )
 from app.tools import (
     _extract_icd10_codes,
@@ -40,6 +42,7 @@ from app.tools import (
 class _DummyToolContext:
     def __init__(self) -> None:
         self.state: dict[str, Any] = {}
+        self.route: str | None = None
 
     async def save_artifact(self, filename: str, part: Any) -> int:
         return 1
@@ -61,12 +64,36 @@ def test_app_and_orchestration_configuration() -> None:
     node_names = {node.name for node in disease_characterisation_pipeline.graph.nodes}
     assert {
         "disease_resolver_agent",
+        "check_ontology_resolution",
+        "unresolved_disease_handler",
         "targets_agent",
         "treatments_agent",
         "literature_agent",
         "research_join",
         "dossier_synthesizer_agent",
     }.issubset(node_names)
+
+
+@pytest.mark.asyncio
+async def test_short_circuit_routing_on_ontology_resolution() -> None:
+    """Verify check_ontology_resolution routes 'resolved' vs 'unresolved' based on session state."""
+    ctx_ok = _DummyToolContext()
+    ctx_ok.state["resolution_status"] = "success"
+    ctx_ok.state["efo_id"] = "EFO_0000768"
+    out_ok = await check_ontology_resolution(ctx_ok, "Resolved IPF")  # type: ignore[arg-type]
+    assert ctx_ok.route == "resolved"
+    assert out_ok == "Resolved IPF"
+
+    ctx_fail = _DummyToolContext()
+    ctx_fail.state["resolution_status"] = "not_found"
+    ctx_fail.state["efo_id"] = "Not yet resolved."
+    out_fail = await check_ontology_resolution(ctx_fail, "No match")  # type: ignore[arg-type]
+    assert ctx_fail.route == "unresolved"
+    assert out_fail == "No match"
+
+    short_circuit_msg = await unresolved_disease_handler(ctx_fail, "No match for 'XYZ'")  # type: ignore[arg-type]
+    assert "Disease Ontology Resolution Unsuccessful" in short_circuit_msg
+    assert "Disclaimer:" in short_circuit_msg
 
 
 def test_extract_icd10_codes() -> None:
@@ -82,13 +109,15 @@ def test_extract_icd10_codes() -> None:
     assert codes == ["ICD10:J84.1", "ICD10:J84.112"]
 
 
-@patch("app.tools.httpx.Client")
-def test_resolve_disease_ontology_contract(mock_client_cls: MagicMock) -> None:
-    """Verify resolve_disease_ontology returns EFO ID, ICD-10 codes, and populates state."""
-    mock_client = MagicMock()
-    mock_client_cls.return_value.__enter__.return_value = mock_client
+@pytest.mark.asyncio
+@patch("app.tools.httpx.AsyncClient")
+async def test_resolve_disease_ontology_contract(mock_client_cls: MagicMock) -> None:
+    """Verify resolve_disease_ontology returns EFO ID, ICD-10 codes, and populates structured state keys."""
+    mock_client = AsyncMock()
+    mock_client_cls.return_value.__aenter__.return_value = mock_client
 
     search_response = MagicMock()
+    search_response.status_code = 200
     search_response.json.return_value = {
         "data": {
             "search": {
@@ -104,6 +133,7 @@ def test_resolve_disease_ontology_contract(mock_client_cls: MagicMock) -> None:
     }
 
     details_response = MagicMock()
+    details_response.status_code = 200
     details_response.json.return_value = {
         "data": {
             "disease": {
@@ -111,8 +141,15 @@ def test_resolve_disease_ontology_contract(mock_client_cls: MagicMock) -> None:
                 "name": "idiopathic pulmonary fibrosis",
                 "description": "Chronic progressive fibrosing interstitial pneumonia.",
                 "dbXRefs": ["ICD10:J84.1", "MONDO:0008345"],
-                "synonyms": [{"relation": "exact", "terms": ["IPF", "cryptogenic fibrosing alveolitis"]}],
-                "therapeuticAreas": [{"id": "OTAR_0000010", "name": "respiratory or thoracic disease"}],
+                "synonyms": [
+                    {
+                        "relation": "exact",
+                        "terms": ["IPF", "cryptogenic fibrosing alveolitis"],
+                    }
+                ],
+                "therapeuticAreas": [
+                    {"id": "OTAR_0000010", "name": "respiratory or thoracic disease"}
+                ],
             }
         }
     }
@@ -120,22 +157,28 @@ def test_resolve_disease_ontology_contract(mock_client_cls: MagicMock) -> None:
     mock_client.post.side_effect = [search_response, details_response]
 
     ctx = _DummyToolContext()
-    result = resolve_disease_ontology("Idiopathic Pulmonary Fibrosis", ctx)  # type: ignore[arg-type]
+    result = await resolve_disease_ontology("Idiopathic Pulmonary Fibrosis", ctx)  # type: ignore[arg-type]
 
     assert result["status"] == "success"
     assert result["efo_id"] == "EFO_0000768"
     assert result["icd10_codes"] == ["ICD10:J84.1"]
     assert "IPF" in result["synonyms"]
+    assert ctx.state["resolution_status"] == "success"
+    assert ctx.state["efo_id"] == "EFO_0000768"
+    assert ctx.state["canonical_disease_name"] == "idiopathic pulmonary fibrosis"
+    assert ctx.state["icd10_codes_str"] == "ICD10:J84.1"
     assert ctx.state["disease_context"]["efo_id"] == "EFO_0000768"
 
 
-@patch("app.tools.httpx.Client")
-def test_fetch_known_targets_contract(mock_client_cls: MagicMock) -> None:
+@pytest.mark.asyncio
+@patch("app.tools.httpx.AsyncClient")
+async def test_fetch_known_targets_contract(mock_client_cls: MagicMock) -> None:
     """Verify fetch_known_targets parses target symbols, scores, and tractability."""
-    mock_client = MagicMock()
-    mock_client_cls.return_value.__enter__.return_value = mock_client
+    mock_client = AsyncMock()
+    mock_client_cls.return_value.__aenter__.return_value = mock_client
 
     mock_resp = MagicMock()
+    mock_resp.status_code = 200
     mock_resp.json.return_value = {
         "data": {
             "disease": {
@@ -176,7 +219,7 @@ def test_fetch_known_targets_contract(mock_client_cls: MagicMock) -> None:
     }
     mock_client.post.return_value = mock_resp
 
-    result = fetch_known_targets("EFO_0000768", 5)
+    result = await fetch_known_targets("EFO_0000768", 5)
     assert result["status"] == "success"
     assert result["total_associated_targets"] == 120
     assert len(result["targets"]) == 1
@@ -187,13 +230,15 @@ def test_fetch_known_targets_contract(mock_client_cls: MagicMock) -> None:
     ]
 
 
-@patch("app.tools.httpx.Client")
-def test_fetch_treatments_and_trials_contract(mock_client_cls: MagicMock) -> None:
-    """Verify fetch_treatments_and_trials deduplicates drugs and parses ClinicalTrials.gov studies."""
-    mock_client = MagicMock()
-    mock_client_cls.return_value.__enter__.return_value = mock_client
+@pytest.mark.asyncio
+@patch("app.tools.httpx.AsyncClient")
+async def test_fetch_treatments_and_trials_contract(mock_client_cls: MagicMock) -> None:
+    """Verify fetch_treatments_and_trials concurrently fetches Open Targets drugs and ClinicalTrials.gov studies."""
+    mock_client = AsyncMock()
+    mock_client_cls.return_value.__aenter__.return_value = mock_client
 
     ot_resp = MagicMock()
+    ot_resp.status_code = 200
     ot_resp.json.return_value = {
         "data": {
             "disease": {
@@ -225,6 +270,7 @@ def test_fetch_treatments_and_trials_contract(mock_client_cls: MagicMock) -> Non
     }
 
     ct_resp = MagicMock()
+    ct_resp.status_code = 200
     ct_resp.json.return_value = {
         "studies": [
             {
@@ -249,7 +295,9 @@ def test_fetch_treatments_and_trials_contract(mock_client_cls: MagicMock) -> Non
     mock_client.post.return_value = ot_resp
     mock_client.get.return_value = ct_resp
 
-    result = fetch_treatments_and_trials("EFO_0000768", "Idiopathic Pulmonary Fibrosis", 5)
+    result = await fetch_treatments_and_trials(
+        "EFO_0000768", "Idiopathic Pulmonary Fibrosis", 5
+    )
     assert result["status"] == "success"
     assert len(result["known_drugs"]) == 1
     assert result["known_drugs"][0]["chembl_id"] == "CHEMBL2103830"
@@ -257,48 +305,71 @@ def test_fetch_treatments_and_trials_contract(mock_client_cls: MagicMock) -> Non
     assert result["clinical_trials"][0]["nct_id"] == "NCT01335464"
 
 
-@patch("app.tools.httpx.Client")
-def test_fetch_recent_publications_enforces_max_5_and_preprint_badges(
+@pytest.mark.asyncio
+@patch("app.tools.httpx.AsyncClient")
+async def test_fetch_recent_publications_enforces_max_5_and_balanced_preprints(
     mock_client_cls: MagicMock,
 ) -> None:
-    """Verify fetch_recent_publications caps output at <= 5 and tags bioRxiv/medRxiv preprints."""
-    mock_client = MagicMock()
-    mock_client_cls.return_value.__enter__.return_value = mock_client
+    """Verify fetch_recent_publications caps output at <= 5 and balances peer-reviewed + bioRxiv/medRxiv preprints."""
+    mock_client = AsyncMock()
+    mock_client_cls.return_value.__aenter__.return_value = mock_client
 
-    raw_items = [
+    med_items = [
         {
-            "id": f"PPR_{i}",
-            "source": "PPR" if i % 2 == 0 else "MED",
-            "title": f"Study {i} on Fibrosis",
+            "id": f"MED_{i}",
+            "source": "MED",
+            "title": f"Peer-Reviewed Study {i} on Fibrosis",
             "authorString": "Smith J et al.",
-            "journalTitle": "bioRxiv" if i == 0 else ("medRxiv" if i == 2 else "Nature Medicine"),
-            "bookOrReportDetails": {"publisher": "bioRxiv" if i == 0 else ("medRxiv" if i == 2 else "")},
+            "journalTitle": "Nature Medicine",
+            "bookOrReportDetails": {"publisher": ""},
             "pubYear": "2026",
             "firstPublicationDate": f"2026-0{i + 1}-01",
-            "doi": f"10.1101/2026.01.0{i}" if i % 2 == 0 else f"10.1038/s41591-026-000{i}",
-            "pmid": None if i % 2 == 0 else f"3900000{i}",
+            "doi": f"10.1038/s41591-026-000{i}",
+            "pmid": f"3900000{i}",
             "citedByCount": i,
-            "abstractText": "<p>Abstract text for study.</p>",
+            "abstractText": "<p>Abstract text for peer-reviewed study.</p>",
         }
-        for i in range(8)
+        for i in range(5)
     ]
 
-    epmc_resp = MagicMock()
-    epmc_resp.json.return_value = {"resultList": {"result": raw_items}}
-    mock_client.get.return_value = epmc_resp
+    ppr_items = [
+        {
+            "id": f"PPR_{i}",
+            "source": "PPR",
+            "title": f"Preprint Study {i} on Fibrosis",
+            "authorString": "Lee K et al.",
+            "journalTitle": "bioRxiv" if i == 0 else "medRxiv",
+            "bookOrReportDetails": {"publisher": "bioRxiv" if i == 0 else "medRxiv"},
+            "pubYear": "2026",
+            "firstPublicationDate": f"2026-0{i + 1}-02",
+            "doi": f"10.1101/2026.01.0{i}",
+            "pmid": None,
+            "citedByCount": 0,
+            "abstractText": "<p>Abstract text for preprint study.</p>",
+        }
+        for i in range(4)
+    ]
 
-    # Even if caller passes max_results=10, tool must strictly cap at 5
-    result = fetch_recent_publications("Idiopathic Pulmonary Fibrosis", 10)
+    med_resp = MagicMock()
+    med_resp.status_code = 200
+    med_resp.json.return_value = {"hitCount": 5, "resultList": {"result": med_items}}
+
+    ppr_resp = MagicMock()
+    ppr_resp.status_code = 200
+    ppr_resp.json.return_value = {"hitCount": 4, "resultList": {"result": ppr_items}}
+
+    mock_client.get.side_effect = [med_resp, ppr_resp]
+
+    # Even if caller passes max_results=10, tool must strictly cap at 5 (3 peer-reviewed + 2 preprints)
+    result = await fetch_recent_publications("Idiopathic Pulmonary Fibrosis", 10)
     assert result["status"] == "success"
     assert result["returned_count"] == 5
     assert len(result["publications"]) == 5
 
-    assert result["publications"][0]["is_preprint"] is True
-    assert result["publications"][0]["source_badge"] == "[Preprint - bioRxiv]"
-    assert result["publications"][1]["is_preprint"] is False
-    assert result["publications"][1]["source_badge"] == "[Peer-Reviewed]"
-    assert result["publications"][2]["is_preprint"] is True
-    assert result["publications"][2]["source_badge"] == "[Preprint - medRxiv]"
+    badges = [p["source_badge"] for p in result["publications"]]
+    assert badges.count("[Peer-Reviewed]") == 3
+    assert "[Preprint - bioRxiv]" in badges
+    assert "[Preprint - medRxiv]" in badges
 
 
 @pytest.mark.asyncio
@@ -416,4 +487,3 @@ def test_required_tool_trajectory_metric() -> None:
     verdict = evaluate(instance)
     assert verdict["score"] == 1.0
     assert "5/5" in verdict["explanation"]
-
