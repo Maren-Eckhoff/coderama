@@ -895,4 +895,114 @@ async def test_strategic_model_routing_tiers_and_fallback() -> None:
         assert req.model == FAST_MODEL
 
 
+@pytest.mark.asyncio
+async def test_intent_vs_outcome_structured_logging_across_agent_model_and_tool() -> None:
+    """Verify DiseaseObservabilityPlugin logs pre-execution Intent before post-execution Outcome across agents, models, and tools."""
+    import json
+    import logging
+
+    from google.adk.models.llm_request import LlmRequest
+    from google.adk.models.llm_response import LlmResponse
+    from google.adk.tools.function_tool import FunctionTool
+    from google.genai import types
+
+    from app.app_utils.telemetry import (
+        DiseaseObservabilityPlugin,
+        TraceCorrelatedJsonFormatter,
+        telemetry_logger,
+    )
+
+    captured_json_logs: list[dict[str, Any]] = []
+
+    class _CaptureHandler(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.setFormatter(
+                TraceCorrelatedJsonFormatter(project_id="kaggle-sandbox-686020")
+            )
+
+        def emit(self, record: logging.LogRecord) -> None:
+            captured_json_logs.append(json.loads(self.format(record)))
+
+    handler = _CaptureHandler()
+    telemetry_logger.addHandler(handler)
+    try:
+        plugin = DiseaseObservabilityPlugin()
+        ctx = _DummyToolContext()
+        ctx.state["efo_id"] = "EFO_0000768"
+        ctx.state["resolution_status"] = "success"
+
+        dummy_agent = MagicMock()
+        dummy_agent.name = "targets_agent"
+        dummy_agent.description = "Fetches top known biological targets."
+
+        # 1. Agent Intent -> Agent Outcome
+        await plugin.before_agent_callback(
+            agent=dummy_agent, callback_context=ctx  # type: ignore[arg-type]
+        )
+        # 2. Model Intent -> Model Outcome (including planned tool call)
+        ft = FunctionTool(fetch_known_targets)
+        llm_req = LlmRequest(
+            model="gemini-3.8-flash",
+            contents=[],
+            tools_dict={"fetch_known_targets": ft},
+        )
+        ctx.agent_name = "targets_agent"  # type: ignore[attr-defined]
+        await plugin.before_model_callback(
+            callback_context=ctx, llm_request=llm_req  # type: ignore[arg-type]
+        )
+        llm_resp = LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[
+                    types.Part.from_function_call(
+                        name="fetch_known_targets",
+                        args={"efo_id": "EFO_0000768", "limit": 5},
+                    )
+                ],
+            )
+        )
+        await plugin.after_model_callback(
+            callback_context=ctx, llm_response=llm_resp  # type: ignore[arg-type]
+        )
+
+        # 3. Tool Intent -> Tool Outcome
+        tool_args = {"efo_id": "EFO_0000768", "limit": 5}
+        await plugin.before_tool_callback(
+            tool=ft, tool_args=tool_args, tool_context=ctx
+        )
+        await plugin.after_tool_callback(
+            tool=ft,
+            tool_args=tool_args,
+            tool_context=ctx,
+            result={"status": "success", "efo_id": "EFO_0000768", "targets": [{"gene_symbol": "TGFB1"}]},
+        )
+
+        await plugin.after_agent_callback(
+            agent=dummy_agent, callback_context=ctx  # type: ignore[arg-type]
+        )
+
+        event_types = [entry.get("event_type") for entry in captured_json_logs]
+        assert event_types == [
+            "agent_intent",
+            "llm_intent",
+            "llm_usage",
+            "tool_intent",
+            "tool_completed",
+            "agent_completed",
+        ]
+
+        tool_intent_log = captured_json_logs[3]
+        tool_outcome_log = captured_json_logs[4]
+        assert tool_intent_log["phase"] == "intent"
+        assert "EFO_0000768" in tool_intent_log["intended_action"]
+        assert tool_outcome_log["phase"] == "outcome"
+        assert tool_outcome_log["intended_action"] == tool_intent_log["intended_action"]
+        assert tool_outcome_log["intent_fulfilled"] is True
+        assert "targets_returned=1" in tool_outcome_log["outcome_summary"]
+    finally:
+        telemetry_logger.removeHandler(handler)
+
+
+
 

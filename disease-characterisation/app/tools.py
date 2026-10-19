@@ -66,7 +66,21 @@ async def _async_request_with_retry(
     max_attempts: int = 3,
     **kwargs: Any,
 ) -> httpx.Response:
-    """Executes an async HTTP request with exponential backoff on transient 429/5xx errors."""
+    """Executes an async HTTP request with exponential backoff and explicit intent-vs-outcome logging."""
+    intended_action = f"HTTP {method.upper()} {url}"
+    logger.info(
+        "External biomedical API intent: %s",
+        intended_action,
+        extra={
+            "structured_data": {
+                "event_type": "external_api_intent",
+                "phase": "intent",
+                "intended_action": intended_action,
+                "http_method": method.upper(),
+                "target_url": url,
+            }
+        },
+    )
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -80,12 +94,43 @@ async def _async_request_with_retry(
             ):
                 await asyncio.sleep(0.3 * (2 ** (attempt - 1)))
                 continue
+            fulfilled = 200 <= resp.status_code < 400
+            logger.info(
+                "External biomedical API outcome: %s -> status=%s",
+                intended_action,
+                resp.status_code,
+                extra={
+                    "structured_data": {
+                        "event_type": "external_api_outcome",
+                        "phase": "outcome",
+                        "intended_action": intended_action,
+                        "status_code": resp.status_code,
+                        "attempt": attempt,
+                        "intent_fulfilled": fulfilled,
+                    }
+                },
+            )
             return resp
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             last_exc = exc
             if attempt < max_attempts:
                 await asyncio.sleep(0.3 * (2 ** (attempt - 1)))
             else:
+                logger.error(
+                    "External biomedical API transport error for '%s': %s",
+                    intended_action,
+                    exc,
+                    extra={
+                        "structured_data": {
+                            "event_type": "external_api_outcome",
+                            "phase": "outcome",
+                            "intended_action": intended_action,
+                            "attempt": attempt,
+                            "intent_fulfilled": False,
+                            "error": str(exc),
+                        }
+                    },
+                )
                 raise
     if last_exc is not None:
         raise last_exc

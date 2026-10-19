@@ -110,7 +110,7 @@ root_agent (Coordinator LlmAgent)
 3. **Unit & Eval Thresholds**:
    - All `pytest` unit tests for biomedical API tools pass (`100%`).
    - ADK evaluation suite (`agents-cli eval run`) meets configured thresholds for tool trajectory and grounded response quality.
-4. **Observability**: OpenTelemetry / Cloud Trace spans (`invocation`, `agent_run`, `call_llm`, `execute_tool`) are emitted and verifiable.
+4. **Observability & Intent-vs-Outcome Capture**: OpenTelemetry / Cloud Trace spans (`invocation`, `agent_run`, `call_llm`, `execute_tool`, `memory.async_consolidation`) and Cloud Logging-correlated JSON events explicitly pair pre-execution **Intent** (`user_intent_received`, `agent_intent`, `llm_intent`, `tool_intent`, `external_api_intent` with `phase="intent"` and `intended_action`) with post-execution **Outcome** (`agent_completed`, `llm_usage` with `planned_tool_calls`, `tool_completed`, `external_api_outcome` with `phase="outcome"`, `outcome_summary`, and `intent_fulfilled`).
 
 ---
 
