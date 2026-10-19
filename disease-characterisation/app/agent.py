@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dotenv import load_dotenv
 from google.adk.agents import Agent, ParallelAgent, SequentialAgent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.apps.app import App, EventsCompactionConfig
 from google.adk.models import Gemini
 from google.adk.plugins import ReflectAndRetryToolPlugin
 from google.genai import types
+
+load_dotenv()
 
 from app.tools import (
     fetch_known_targets,
