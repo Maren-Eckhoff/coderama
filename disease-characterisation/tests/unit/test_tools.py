@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.agent import (
+    ambiguous_disease_handler,
     app,
     check_ontology_resolution,
     disease_characterisation_pipeline,
@@ -43,6 +44,14 @@ class _DummyToolContext:
     def __init__(self) -> None:
         self.state: dict[str, Any] = {}
         self.route: str | None = None
+        self.function_call_id: str | None = "call-123"
+        self.tool_confirmation: Any = None
+        self.confirmation_requests: list[dict[str, Any]] = []
+
+    def request_confirmation(
+        self, *, hint: str | None = None, payload: Any | None = None
+    ) -> None:
+        self.confirmation_requests.append({"hint": hint, "payload": payload})
 
     async def save_artifact(self, filename: str, part: Any) -> int:
         return 1
@@ -65,6 +74,7 @@ def test_app_and_orchestration_configuration() -> None:
     assert {
         "disease_resolver_agent",
         "check_ontology_resolution",
+        "ambiguous_disease_handler",
         "unresolved_disease_handler",
         "targets_agent",
         "treatments_agent",
@@ -75,14 +85,29 @@ def test_app_and_orchestration_configuration() -> None:
 
 
 @pytest.mark.asyncio
-async def test_short_circuit_routing_on_ontology_resolution() -> None:
-    """Verify check_ontology_resolution routes 'resolved' vs 'unresolved' based on session state."""
+async def test_short_circuit_and_ambiguous_routing_on_ontology_resolution() -> None:
+    """Verify check_ontology_resolution routes 'resolved', 'ambiguous', and 'unresolved' based on session state."""
     ctx_ok = _DummyToolContext()
     ctx_ok.state["resolution_status"] = "success"
     ctx_ok.state["efo_id"] = "EFO_0000768"
     out_ok = await check_ontology_resolution(ctx_ok, "Resolved IPF")  # type: ignore[arg-type]
     assert ctx_ok.route == "resolved"
     assert out_ok == "Resolved IPF"
+
+    ctx_amb = _DummyToolContext()
+    ctx_amb.state["resolution_status"] = "ambiguous"
+    ctx_amb.state["ambiguous_candidates"] = [
+        {"name": "type 2 diabetes mellitus", "efo_id": "MONDO_0005148", "description": "Adult-onset diabetes."},
+        {"name": "type 1 diabetes mellitus", "efo_id": "MONDO_0005147", "description": "Autoimmune diabetes."},
+    ]
+    out_amb = await check_ontology_resolution(ctx_amb, "Ambiguous diabetes")  # type: ignore[arg-type]
+    assert ctx_amb.route == "ambiguous"
+    assert out_amb == "Ambiguous diabetes"
+
+    amb_msg = await ambiguous_disease_handler(ctx_amb, "Multiple matches found.")  # type: ignore[arg-type]
+    assert "Human-in-the-Loop Disambiguation Required" in amb_msg
+    assert "MONDO_0005148" in amb_msg
+    assert "MONDO_0005147" in amb_msg
 
     ctx_fail = _DummyToolContext()
     ctx_fail.state["resolution_status"] = "not_found"
@@ -160,6 +185,7 @@ async def test_resolve_disease_ontology_contract(mock_client_cls: MagicMock) -> 
     result = await resolve_disease_ontology("Idiopathic Pulmonary Fibrosis", ctx)  # type: ignore[arg-type]
 
     assert result["status"] == "success"
+    assert result["resolution_confidence"] == "exact_name"
     assert result["efo_id"] == "EFO_0000768"
     assert result["icd10_codes"] == ["ICD10:J84.1"]
     assert "IPF" in result["synonyms"]
@@ -168,6 +194,88 @@ async def test_resolve_disease_ontology_contract(mock_client_cls: MagicMock) -> 
     assert ctx.state["canonical_disease_name"] == "idiopathic pulmonary fibrosis"
     assert ctx.state["icd10_codes_str"] == "ICD10:J84.1"
     assert ctx.state["disease_context"]["efo_id"] == "EFO_0000768"
+
+
+@pytest.mark.asyncio
+@patch("app.tools.httpx.AsyncClient")
+async def test_resolve_disease_ontology_direct_id_and_ambiguous_disambiguation(
+    mock_client_cls: MagicMock,
+) -> None:
+    """Verify direct EFO ID lookup and HITL disambiguation on ambiguous multi-hit queries."""
+    mock_client = AsyncMock()
+    mock_client_cls.return_value.__aenter__.return_value = mock_client
+
+    # 1. Direct ID lookup (skips SearchDisease and calls DiseaseDetails directly)
+    details_response = MagicMock()
+    details_response.status_code = 200
+    details_response.json.return_value = {
+        "data": {
+            "disease": {
+                "id": "EFO_0000768",
+                "name": "idiopathic pulmonary fibrosis",
+                "description": "Chronic progressive fibrosing interstitial pneumonia.",
+                "dbXRefs": ["ICD10:J84.1"],
+                "synonyms": [{"relation": "exact", "terms": ["IPF"]}],
+                "therapeuticAreas": [],
+            }
+        }
+    }
+    mock_client.post.side_effect = [details_response]
+    ctx_direct = _DummyToolContext()
+    direct_res = await resolve_disease_ontology("EFO:0000768", ctx_direct)  # type: ignore[arg-type]
+    assert direct_res["status"] == "success"
+    assert direct_res["resolution_confidence"] == "direct_id"
+    assert direct_res["efo_id"] == "EFO_0000768"
+
+    # 2. Ambiguous query ("muscular dystrophy" matching Duchenne, Becker, and Myotonic without exact match)
+    amb_search_resp = MagicMock()
+    amb_search_resp.status_code = 200
+    amb_search_resp.json.return_value = {
+        "data": {
+            "search": {
+                "hits": [
+                    {
+                        "id": "MONDO_0010679",
+                        "name": "Duchenne muscular dystrophy",
+                        "description": "Severe X-linked muscular dystrophy.",
+                    },
+                    {
+                        "id": "MONDO_0010311",
+                        "name": "Becker muscular dystrophy",
+                        "description": "X-linked recessive muscular dystrophy.",
+                    },
+                ]
+            }
+        }
+    }
+    amb_details_resp = MagicMock()
+    amb_details_resp.status_code = 200
+    amb_details_resp.json.return_value = {
+        "data": {
+            "disease": {
+                "id": "MONDO_0010679",
+                "name": "Duchenne muscular dystrophy",
+                "description": "Severe X-linked muscular dystrophy.",
+                "dbXRefs": ["ICD10:G71.0"],
+                "synonyms": [{"relation": "exact", "terms": ["DMD"]}],
+                "therapeuticAreas": [],
+            }
+        }
+    }
+    mock_client.post.side_effect = [amb_search_resp, amb_details_resp]
+    ctx_amb = _DummyToolContext()
+    amb_res = await resolve_disease_ontology("dystrophy", ctx_amb)  # type: ignore[arg-type]
+
+    assert amb_res["status"] == "ambiguous"
+    assert amb_res["requires_human_disambiguation"] is True
+    assert amb_res["resolution_confidence"] == "ambiguous"
+    assert len(amb_res["candidates"]) == 2
+    assert ctx_amb.state["resolution_status"] == "ambiguous"
+    assert len(ctx_amb.confirmation_requests) == 1
+    assert (
+        ctx_amb.confirmation_requests[0]["payload"]["default_efo_id"]
+        == "MONDO_0010679"
+    )
 
 
 @pytest.mark.asyncio
